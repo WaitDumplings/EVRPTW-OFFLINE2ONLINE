@@ -375,8 +375,9 @@ class NonDyanmicEmbedding(nn.Module):
 
     """
 
-    def __init__(self, embedding_dim):
+    def __init__(self, embedding_dim, **kwargs):
         super(NonDyanmicEmbedding, self).__init__()
+        del kwargs
 
     def forward(self, state):
         return 0, 0, 0

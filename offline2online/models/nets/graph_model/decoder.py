@@ -548,6 +548,10 @@ class Decoder(nn.Module):
                 + logit_key_dynamic
                 + structured_logit_delta
             )
+        elif structured_key_delta.dim() == 4:
+            glimpse_K = glimpse_K.unsqueeze(1) + structured_key_delta
+            glimpse_V = glimpse_V.unsqueeze(1) + structured_val_delta
+            logit_K = logit_K.unsqueeze(1) + structured_logit_delta
         else:
             structured_key_delta = structured_key_delta.squeeze(1)
             structured_val_delta = structured_val_delta.squeeze(1)

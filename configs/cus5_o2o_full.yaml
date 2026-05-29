@@ -1,0 +1,71 @@
+run_name: O2O_TERRAN_FULL
+dataset_name: EVRPTW-D_Geo-AC-v1
+data:
+  generator_config: configs/amazon_hierarchy.yaml
+  num_customers: 5
+  num_charging_stations: 3
+  mother_board_pool_size: 32
+  mother_num_customers: 5000
+  mother_num_charging_stations: 120
+  region_reuse_limit: 200
+  max_attempts_per_instance: 30
+  territory_pool_path: null
+  region_pool_path: null
+  region_pool_shuffle: true
+  region_pool_replacement_policy: cycle
+  train_dataset_path: EVRPTW_Dataset/dataset_v1/dataset/train/Cus5
+  train_sample_mode: shuffle_cycle
+  async_instance_prefetch: false
+  async_instance_workers: 8
+  async_instance_queue_batches: 2
+  async_multiprocessing_context: spawn
+env:
+  use_fast_env: true
+  use_jit_mask: true
+  normalize_reward: true
+  reward_distance_scale_mode: dataset_single_customer_repair_median
+  charging_mode: fixed_full
+model:
+  embedding_dim: 256
+  tanh_clipping: 15.0
+  n_encode_layers: 2
+  use_graph_token: true
+  use_dynamic_embedding: true
+  use_candidate_dynamic_embedding: true
+training:
+  online_training: false
+  epochs: 500
+  num_envs_per_gpu: 1024
+  n_traj: 50
+  rollout_steps: 15
+  ppo_step_chunk_size: 64
+  ppo_update_epochs: 3
+  num_minibatches: 16
+  gamma: 0.99
+  clip_coef: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.01
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  checkpoint_interval: 50
+  debug: false
+  debug_log_every: 1
+  profile_timing: false
+  gradient_accumulation_steps: 1
+pbrs:
+  use_customer_pbrs: false
+  use_repair_distance_pbrs: false
+  use_feasible_ratio_pbrs: false
+  use_terminal_heuristic: false
+evaluation:
+  eval_interval: 10
+  eval_path: EVRPTW_Dataset/dataset_v1/dataset/val/Cus5
+  eval_n_traj: 50
+  eval_decode_mode: sample
+  eval_max_steps: 15
+  eval_limit: null
+  eval_batch_size: 1000
+  eval_num_batches: null
+  eval_info_level: light
+  eval_save_routes: false
