@@ -40,6 +40,8 @@ results/offline_experts/dataset_v1/train/Cus5_Gurobi/gurobi_summary.csv
 results/offline_experts/dataset_v1/train/Cus15_Gurobi_2h/gurobi_summary.csv
 ```
 
+Gurobi archives may contain incumbent solutions from interrupted runs. Numeric status `2` (`OPTIMAL`) and `9` (`TIME_LIMIT`), plus textual statuses such as `OPTIMAL`, `TIME_LIMIT`, `RUNNING`, `SUBOPTIMAL`, and `FEASIBLE`, are treated as usable when they include a finite objective and route payload.
+
 ## Main Configs
 
 Main configs live in `configs/`:
@@ -48,6 +50,7 @@ Main configs live in `configs/`:
 - `cus5_o2o_ppo.yaml`: explicit PPO baseline.
 - `cus5_o2o_sl_ppo.yaml`: proposed solution-level SL-PPO, default reference advantage.
 - `cus15_o2o_sl_ppo.yaml`: Cus15 SL-PPO scaffold using a Cus15 solver archive.
+- `cus50_o2o_sl_ppo_group_ref_1000.yaml`: Cus50 SL-PPO comparison run with group + reference route advantages.
 
 Dynamic embedding is disabled by default. Graph token remains enabled. The trainer forces `env_fast` and supports AMP through `training.mixed_precision: true`.
 
@@ -90,17 +93,38 @@ Ablation-only configs and scripts live in `ablation/`:
 
 - `ablation/configs/cus5_o2o_bc_ppo.yaml`: BC warmup + PPO baseline.
 - `ablation/configs/cus5_o2o_dapg.yaml`: DAPG-style demonstration gradient baseline.
+- `ablation/configs/cus50_o2o_dapg_1000.yaml`: Cus50 DAPG comparison run with BC pretraining and DAPG fine-tuning.
 - `ablation/configs/cus5_o2o_route_bc_ppo.yaml`: route-level imitation baseline, the old implementation previously called SL-PPO.
 - `ablation/configs/cus5_o2o_ppo_group_adv.yaml`: PPO with step-level group advantage.
 - `ablation/configs/cus5_o2o_ppo_ref_adv.yaml`: PPO with step-level reference advantage.
 - `ablation/configs/cus5_o2o_sl_ppo_group_adv.yaml`: true SL-PPO with group-only route advantage.
 - `ablation/configs/cus5_o2o_sl_ppo_ref_adv.yaml`: true SL-PPO with reference-only route advantage.
 
+DAPG follows the original two-stage structure: optional behavior cloning warmup first, then PPO with an additional demonstration-gradient loss. During fine-tuning the demo loss coefficient is:
+
+```text
+coef_demo = lambda0 * lambda1^k * max(A_on_policy)
+```
+
+where `lambda0` defaults to `offline.bc_coef`, `lambda1` defaults to `offline.bc_decay`, and `k` starts at zero after the BC warmup phase.
+
 Example:
 
 ```bash
 python -m offline2online.train --config ablation/configs/cus5_o2o_dapg.yaml --seed 2005 --epochs 1000
 ```
+
+## Cus50 Comparison Helpers
+
+The current Cus50 comparison uses the same seed, rollout length, PPO update count, graph token, and attention bias for SL-PPO and DAPG. Dynamic embedding is intentionally disabled in both configs.
+
+```bash
+bash scripts/run_cus50_slppo_group_ref_1000.sh
+bash scripts/run_cus50_dapg_1000.sh
+bash scripts/watch_cus50_slppo_dapg_plot.sh
+```
+
+The plot helper overlays SL-PPO, DAPG, and the validation-set Gurobi best average from `/data/Maojie/gurobi_mul/results/val/Cus50/gurobi_summary.csv`.
 
 ## Outputs
 

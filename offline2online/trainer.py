@@ -822,7 +822,11 @@ def train_from_config(
             bc_updates_per_epoch = int(offline_cfg.get("bc_updates_per_epoch", offline_cfg.get("offline_updates_per_epoch", 1)))
             route_updates_per_epoch = int(offline_cfg.get("route_updates_per_epoch", offline_cfg.get("offline_updates_per_epoch", 1)))
             offline_coef = _offline_coef(offline_cfg, epoch)
-            do_bc_warmup = offline_method in {"bc_ppo", "bc-ppo"} and expert_buffer is not None and epoch <= bc_warmup_epochs
+            do_bc_warmup = (
+                offline_method in {"bc_ppo", "bc-ppo", "dapg", "bc_dapg", "bc+ppo"}
+                and expert_buffer is not None
+                and epoch <= bc_warmup_epochs
+            )
 
             batch = None
             train_summary = {
@@ -847,7 +851,7 @@ def train_from_config(
                     cfg,
                     device,
                     epoch,
-                    coef=float(offline_cfg.get("bc_warmup_coef", offline_coef)),
+                    coef=float(offline_cfg.get("bc_warmup_coef", 1.0)),
                     updates=max(1, bc_updates_per_epoch),
                     scaler=scaler,
                     amp_enabled=amp_enabled,
@@ -905,6 +909,18 @@ def train_from_config(
                 chunk_size = ppo_step_chunk_size if ppo_step_chunk_size > 0 else total_steps
                 chunk_size = max(1, min(chunk_size, total_steps))
                 dapg_enabled = expert_buffer is not None and offline_method in {"dapg", "bc_dapg", "bc+ppo"}
+                dapg_adv_scale = 1.0
+                dapg_demo_coef = float(offline_coef)
+                if dapg_enabled:
+                    dapg_iteration = max(int(epoch) - int(bc_warmup_epochs) - 1, 0)
+                    dapg_base_coef = float(offline_cfg.get("dapg_lambda0", offline_cfg.get("bc_coef", 0.1)))
+                    dapg_decay = float(offline_cfg.get("dapg_lambda1", offline_cfg.get("bc_decay", 0.95)))
+                    dapg_min_coef = float(offline_cfg.get("min_bc_coef", 0.0))
+                    valid_adv = advantages.detach()[batch.valid]
+                    if valid_adv.numel() > 0:
+                        dapg_adv_scale = max(float(valid_adv.max().detach().cpu().item()), 0.0)
+                    dapg_demo_coef = max(dapg_base_coef * (dapg_decay ** dapg_iteration), dapg_min_coef)
+                    dapg_demo_coef *= dapg_adv_scale
                 dapg_bc_batch_size = int(offline_cfg.get("bc_batch_size", 256))
                 dapg_bc_losses: list[float] = []
                 dapg_bc_accs: list[float] = []
@@ -975,7 +991,7 @@ def train_from_config(
                             group_policy += weighted_policy / group_size
                             group_value += weighted_value / group_size
                             group_entropy += weighted_entropy / group_size
-                        if dapg_enabled and offline_coef > 0.0 and expert_buffer is not None:
+                        if dapg_enabled and dapg_demo_coef > 0.0 and expert_buffer is not None:
                             with _autocast_context(device, amp_enabled):
                                 demo_loss, demo_info = compute_dapg_demo_loss(
                                     agent,
@@ -983,7 +999,7 @@ def train_from_config(
                                     batch_size=dapg_bc_batch_size,
                                     device=device,
                                 )
-                            _backward(float(offline_coef) * demo_loss, scaler, amp_enabled)
+                            _backward(float(dapg_demo_coef) * demo_loss, scaler, amp_enabled)
                             dapg_bc_losses.append(float(demo_info["bc_loss"]))
                             dapg_bc_accs.append(float(demo_info["bc_accuracy"]))
                             dapg_bc_entropies.append(float(demo_info["bc_entropy"]))
@@ -997,7 +1013,7 @@ def train_from_config(
                         "bc_accuracy": float(np.mean(dapg_bc_accs)) if dapg_bc_accs else 0.0,
                         "bc_entropy": float(np.mean(dapg_bc_entropies)) if dapg_bc_entropies else 0.0,
                         "bc_steps": int(dapg_bc_steps),
-                        "bc_coef": float(offline_coef),
+                        "bc_coef": float(dapg_demo_coef),
                         "offline_updates": int(offline_updates),
                     }
                 if sl_enabled:
@@ -1192,4 +1208,3 @@ def train_from_config(
     if callable(close_pool):
         close_pool(terminate=True)
     return ckpt_dir / "checkpoint_final.pt"
-

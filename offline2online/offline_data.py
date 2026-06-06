@@ -75,10 +75,12 @@ def _route_payload(row: dict[str, str]) -> str:
 
 def _is_usable_solution(row: dict[str, str]) -> bool:
     status = str(row.get("status", "")).strip().upper()
+    status_name = str(row.get("status_name", "")).strip().upper()
     # Empty status is allowed for generic solver/heuristic archives. Gurobi may
     # use numeric status 2, while checkpoint traces often store RUNNING with an
     # incumbent.
-    status_ok = not status or status in {"2", "OPTIMAL", "TIME_LIMIT", "RUNNING", "SUBOPTIMAL", "FEASIBLE", "SUCCESS", "OK"}
+    allowed = {"2", "9", "OPTIMAL", "TIME_LIMIT", "RUNNING", "SUBOPTIMAL", "FEASIBLE", "SUCCESS", "OK"}
+    status_ok = not status or status in allowed or status_name in allowed
     if not status_ok:
         return False
     obj = row.get("objective_distance_km", "")
@@ -325,4 +327,3 @@ def compute_route_supervised_loss(agent, buffer: ExpertReplayBuffer, batch_size:
         "sl_step_count": int(action.numel()),
         "sl_avg_route_len": float(route_len.mean().detach().cpu().item()) if num_routes else 0.0,
     }
-
