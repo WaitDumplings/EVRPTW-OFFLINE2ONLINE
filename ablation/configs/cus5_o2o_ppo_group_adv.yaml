@@ -1,4 +1,4 @@
-run_name: O2O_BASIC
+run_name: O2O_PPO_GroupAdv
 dataset_name: EVRPTW-D_Geo-AC-v1
 data:
   generator_config: configs/amazon_hierarchy.yaml
@@ -35,7 +35,7 @@ model:
   use_candidate_dynamic_embedding: false
 training:
   online_training: false
-  epochs: 500
+  epochs: 1000
   num_envs_per_gpu: 1024
   n_traj: 50
   rollout_steps: 15
@@ -71,3 +71,11 @@ evaluation:
   eval_num_batches: null
   eval_info_level: light
   eval_save_routes: false
+offline:
+  method: ppo
+advantage:
+  renormalize_after_aux_advantage: true
+  use_group_advantage: true
+  group_adv_coef: 0.5
+  group_adv_clip: 2.0
+  group_infeasible_penalty: 10.0

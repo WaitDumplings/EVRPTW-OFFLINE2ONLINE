@@ -1,4 +1,4 @@
-run_name: O2O_TERRAN_FULL
+run_name: O2O_BASIC
 dataset_name: EVRPTW-D_Geo-AC-v1
 data:
   generator_config: configs/amazon_hierarchy.yaml
@@ -25,13 +25,14 @@ env:
   normalize_reward: true
   reward_distance_scale_mode: dataset_single_customer_repair_median
   charging_mode: fixed_full
+  info_level: light
 model:
   embedding_dim: 256
   tanh_clipping: 15.0
   n_encode_layers: 2
   use_graph_token: true
-  use_dynamic_embedding: true
-  use_candidate_dynamic_embedding: true
+  use_dynamic_embedding: false
+  use_candidate_dynamic_embedding: false
 training:
   online_training: false
   epochs: 500
@@ -53,6 +54,7 @@ training:
   debug_log_every: 1
   profile_timing: false
   gradient_accumulation_steps: 1
+  mixed_precision: true
 pbrs:
   use_customer_pbrs: false
   use_repair_distance_pbrs: false

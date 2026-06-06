@@ -1,4 +1,4 @@
-run_name: O2O_BASIC
+run_name: O2O_SL_PPO_GroupAdv
 dataset_name: EVRPTW-D_Geo-AC-v1
 data:
   generator_config: configs/amazon_hierarchy.yaml
@@ -35,7 +35,7 @@ model:
   use_candidate_dynamic_embedding: false
 training:
   online_training: false
-  epochs: 500
+  epochs: 1000
   num_envs_per_gpu: 1024
   n_traj: 50
   rollout_steps: 15
@@ -71,3 +71,25 @@ evaluation:
   eval_num_batches: null
   eval_info_level: light
   eval_save_routes: false
+offline:
+  method: sl_ppo
+  expert_solution_path: results/offline_experts/dataset_v1/train/Cus5_Gurobi/gurobi_summary.csv
+  expert_dataset_path: EVRPTW_Dataset/dataset_v1/dataset/train/Cus5
+  expert_limit: null
+  strict_replay: true
+  sl_coef: 0.1
+  route_clip_eps: 0.2
+  only_success_route_loss: true
+advantage:
+  use_group_advantage: true
+  group_adv_coef: 0.3
+  group_adv_clip: 3.0
+  group_adv_std_floor: 5.0
+  use_reference_advantage: false
+  reference_adv_coef: 0.1
+  reference_adv_rho: 0.1
+  reference_adv_clip: 2.0
+  reference_success_only: true
+  use_reference_soft_gate: true
+  reference_soft_gate_eta: 0.05
+  reference_policy_estimate: best

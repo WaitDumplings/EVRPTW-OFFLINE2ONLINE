@@ -138,7 +138,7 @@ class Backbone(nn.Module):
         n_heads: int = 16,
         device: str | torch.device = "cpu",
         use_graph_token: bool = True,
-        use_dynamic_embedding: bool = True,
+        use_dynamic_embedding: bool = False,
         use_candidate_dynamic_embedding: bool | None = None,
     ):
         super().__init__()
@@ -283,7 +283,7 @@ class Agent(nn.Module):
         device: str | torch.device = "cpu",
         name: str = "evrptw",
         use_graph_token: bool = True,
-        use_dynamic_embedding: bool = True,
+        use_dynamic_embedding: bool = False,
         use_candidate_dynamic_embedding: bool | None = None,
     ):
         super().__init__()

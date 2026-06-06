@@ -1,4 +1,4 @@
-run_name: O2O_BASIC
+run_name: O2O_ROUTE_BC_PPO
 dataset_name: EVRPTW-D_Geo-AC-v1
 data:
   generator_config: configs/amazon_hierarchy.yaml
@@ -71,3 +71,12 @@ evaluation:
   eval_num_batches: null
   eval_info_level: light
   eval_save_routes: false
+offline:
+  method: route_bc_ppo
+  expert_solution_path: results/offline_experts/dataset_v1/train/Cus5_Gurobi/gurobi_summary.csv
+  expert_dataset_path: EVRPTW_Dataset/dataset_v1/dataset/train/Cus5
+  expert_limit: null
+  strict_replay: true
+  route_batch_size: 512
+  route_updates_per_epoch: 1
+  route_bc_coef: 1.0

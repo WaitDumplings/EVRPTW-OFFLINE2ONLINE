@@ -1,4 +1,4 @@
-run_name: O2O_BASIC
+run_name: O2O_DAPG
 dataset_name: EVRPTW-D_Geo-AC-v1
 data:
   generator_config: configs/amazon_hierarchy.yaml
@@ -35,7 +35,7 @@ model:
   use_candidate_dynamic_embedding: false
 training:
   online_training: false
-  epochs: 500
+  epochs: 1000
   num_envs_per_gpu: 1024
   n_traj: 50
   rollout_steps: 15
@@ -71,3 +71,16 @@ evaluation:
   eval_num_batches: null
   eval_info_level: light
   eval_save_routes: false
+offline:
+  expert_solution_path: results/offline_experts/dataset_v1/train/Cus5_Gurobi/gurobi_summary.csv
+  expert_dataset_path: EVRPTW_Dataset/dataset_v1/dataset/train/Cus5
+  expert_limit: null
+  strict_replay: true
+  bc_batch_size: 512
+  route_batch_size: 512
+  bc_updates_per_epoch: 1
+  route_updates_per_epoch: 1
+  bc_coef: 1.0
+  bc_decay: 0.995
+  min_bc_coef: 0.0
+  method: dapg
