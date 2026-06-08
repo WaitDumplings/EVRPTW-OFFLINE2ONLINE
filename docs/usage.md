@@ -7,7 +7,7 @@ This repository is the offline-to-online training layer for EVRP-TW policies. It
 Set the EVRPTW-DB root if it is not in the default location:
 
 ```bash
-export EVRPTW_DB_ROOT=/data/Maojie/Github2/EVRPTW-DB
+export EVRPTW_DB_ROOT=/data/Maojie/EVRPTW-DB
 ```
 
 The trainer expects fixed dataset splits such as:
@@ -36,7 +36,9 @@ Main configs live in `configs/`.
 | `cus5_o2o_ppo.yaml` | Vanilla PPO baseline with the O2O backbone. |
 | `cus5_o2o_sl_ppo.yaml` | Proposed solution-level SL-PPO with reference advantage enabled by default. |
 | `cus15_o2o_sl_ppo.yaml` | Cus15 SL-PPO scaffold using a Cus15 solver archive. |
+| `cus15_o2o_sl_ppo_group_ref_u4_1000.yaml` | Cus15 SL-PPO group + reference 1000-epoch comparison config. |
 | `cus50_o2o_sl_ppo_group_ref_1000.yaml` | Cus50 SL-PPO comparison config with route-level group + reference advantages. |
+| `cus50_o2o_sl_ppo_group_ref_u4_1000.yaml` | Cus50 SL-PPO group + reference config with four PPO updates. |
 | `cus5_o2o_full.yaml`, `cus15_o2o_full.yaml`, `cus50_o2o_full.yaml` | Basic PPO configs for different scales. |
 
 Default model/training choices:
@@ -56,6 +58,10 @@ Ablation configs live in `ablation/configs/`.
 | `cus5_o2o_bc_ppo.yaml` | Behavior cloning warmup followed by PPO. |
 | `cus5_o2o_dapg.yaml` | DAPG-style BC warmup followed by PPO with a demonstration gradient. |
 | `cus50_o2o_dapg_1000.yaml` | Cus50 DAPG comparison config matching the current SL-PPO rollout/eval protocol. |
+| `cus50_o2o_dapg_u4_1000.yaml` | Cus50 DAPG comparison config with four PPO updates. |
+| `cus50_o2o_dapg_u4_dyn_1000.yaml` | Cus50 DAPG u4 config with candidate dynamic embedding enabled. |
+| `cus15_o2o_dapg_u4_1000.yaml` | Cus15 DAPG comparison config with four PPO updates. |
+| `cus15_o2o_dapg_u4_dyn_1000.yaml` | Cus15 DAPG u4 config with candidate dynamic embedding enabled. |
 | `cus5_o2o_route_bc_ppo.yaml` | Route-level supervised imitation baseline; this is intentionally not the proposed SL-PPO. |
 | `cus5_o2o_ppo_group_adv.yaml` | PPO with step-level group advantage augmentation. |
 | `cus5_o2o_ppo_ref_adv.yaml` | PPO with step-level reference advantage augmentation. |
@@ -190,7 +196,90 @@ results/figures/cus50_slppo_group_ref_vs_dapg_r70_u2_e1000.pdf
 results/cus50_slppo_group_ref_vs_dapg_r70_u2_e1000_summary.csv
 ```
 
-## 7. Outputs
+For the current u4 and dynamic-embedding comparison, use:
+
+```bash
+bash scripts/run_cus50_slppo_group_ref_u4_1000.sh
+bash scripts/run_cus50_dapg_u4_1000.sh
+bash scripts/run_cus50_dapg_u4_dyn_1000.sh
+bash scripts/watch_cus50_slppo_dapg_plot.sh
+```
+
+The unified Cus50 plot is written to:
+
+```text
+results/figures/cus50_offline_update_ablation_r70_e1000.png
+results/figures/cus50_offline_update_ablation_r70_e1000.pdf
+results/cus50_offline_update_ablation_r70_e1000_summary.csv
+```
+
+Set `CUS50_GUROBI_VAL_SUMMARY=/path/to/gurobi_summary.csv` if the Gurobi validation summary is not in the default local path.
+
+## 7. Cus15 Server Run Protocol
+
+The checked-in Cus15 server bundle mirrors the current u4 comparison while keeping Cus15's shorter rollout horizon:
+
+- Seed: `2005`.
+- Customers/charging stations: `Cus15`, `3` charging stations.
+- Rollout/eval horizon: `40` steps.
+- PPO updates: `training.ppo_update_epochs: 4`.
+- Environments: `training.num_envs_per_gpu: 640`.
+- Minibatches: `training.num_minibatches: 16`.
+- Model: graph token and attention bias enabled; dynamic embedding enabled only in the `*_dyn_*` DAPG config.
+- Validation: full Cus15 validation split, `eval_n_traj: 50`, `eval_batch_size: 1000`.
+- Offline source: `EVRPTW_DB_ROOT/results/offline_experts/dataset_v1/train/Cus15_Gurobi_2h/gurobi_summary.csv`.
+
+On a new server, set paths once:
+
+```bash
+export EVRPTW_DB_ROOT=/path/to/EVRPTW-DB
+export PYTHON_BIN=/path/to/python
+```
+
+Then launch the three comparison runs:
+
+```bash
+# GPU0 by default
+bash scripts/run_cus15_slppo_group_ref_u4_1000.sh
+
+# GPU1 by default; override CUDA_DEVICE to schedule differently
+bash scripts/run_cus15_dapg_u4_1000.sh
+bash scripts/run_cus15_dapg_u4_dyn_1000.sh
+```
+
+Any launch script accepts extra trainer overrides:
+
+```bash
+bash scripts/run_cus15_dapg_u4_dyn_1000.sh --num-envs-per-gpu 320 --eval-limit 100
+```
+
+Refresh the unified Cus15 plot while experiments run:
+
+```bash
+bash scripts/watch_cus15_slppo_dapg_plot.sh
+```
+
+The plot helper reads the three Cus15 `eval_log.csv` files and writes:
+
+```text
+results/figures/cus15_offline_dynamic_update_ablation_r40_e1000.png
+results/figures/cus15_offline_dynamic_update_ablation_r40_e1000.pdf
+results/cus15_offline_dynamic_update_ablation_r40_e1000_summary.csv
+```
+
+By default the Cus15 plot looks for the Gurobi validation summary at:
+
+```text
+EVRPTW_DB_ROOT/results/offline_experts/dataset_v1/val/Cus15_Gurobi_2h/gurobi_summary.csv
+```
+
+Override it when needed:
+
+```bash
+export CUS15_GUROBI_VAL_SUMMARY=/path/to/Cus15/val/gurobi_summary.csv
+```
+
+## 8. Outputs
 
 Outputs are written under `results/`, which is ignored by git:
 
@@ -207,7 +296,7 @@ Important files:
 - `checkpoint_best.pt`: best validation checkpoint.
 - `checkpoint_final.pt`: final checkpoint.
 
-## 8. Reproducibility Notes
+## 9. Reproducibility Notes
 
 - Training uses the train split. Validation uses the val split. Eval/test should be run separately and should not be used for early stopping or method selection.
 - Offline archives used for training must correspond to the training split unless the experiment is explicitly studying transfer or leakage.

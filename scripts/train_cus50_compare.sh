@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EVRPTW_DB_ROOT="${EVRPTW_DB_ROOT:-/data/Maojie/Github2/EVRPTW-DB}"
+EVRPTW_DB_ROOT="${EVRPTW_DB_ROOT:-/data/Maojie/EVRPTW-DB}"
 export EVRPTW_DB_ROOT
 export PYTHONPATH="$ROOT:$EVRPTW_DB_ROOT:${PYTHONPATH:-}"
 
@@ -41,4 +41,3 @@ CUDA_VISIBLE_DEVICES=1 python "${O2O_COMMON[@]}" --seed 2006 \
 
 wait
 python -m offline2online.summarize_cus50_comparison
-

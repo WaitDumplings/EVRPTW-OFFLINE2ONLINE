@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EVRPTW_DB_ROOT="${EVRPTW_DB_ROOT:-/data/Maojie/Github2/EVRPTW-DB}"
+EVRPTW_DB_ROOT="${EVRPTW_DB_ROOT:-/data/Maojie/EVRPTW-DB}"
 export EVRPTW_DB_ROOT
 export PYTHONPATH="$ROOT:$EVRPTW_DB_ROOT:${PYTHONPATH:-}"
 
@@ -19,4 +19,3 @@ python -m offline2online.train \
   --eval-n-traj 2 \
   --device cpu \
   --debug
-

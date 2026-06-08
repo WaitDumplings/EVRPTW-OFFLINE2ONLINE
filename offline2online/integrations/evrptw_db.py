@@ -6,7 +6,7 @@ import sys
 
 
 DEFAULT_EVRPTW_DB_ROOT = Path(
-    os.environ.get("EVRPTW_DB_ROOT", "/data/Maojie/Github2/EVRPTW-DB")
+    os.environ.get("EVRPTW_DB_ROOT", "/data/Maojie/EVRPTW-DB")
 ).resolve()
 
 
@@ -30,4 +30,3 @@ def resolve_db_path(path: str | Path | None, db_root: str | Path | None = None) 
     root = Path(db_root).resolve() if db_root else DEFAULT_EVRPTW_DB_ROOT
     out = Path(path)
     return out if out.is_absolute() else root / out
-

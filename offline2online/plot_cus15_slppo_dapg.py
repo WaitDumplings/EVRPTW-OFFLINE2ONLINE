@@ -14,41 +14,30 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SEED = int(os.environ.get("SEED", "2005"))
+EVRPTW_DB_ROOT = Path(os.environ.get("EVRPTW_DB_ROOT", "/data/Maojie/EVRPTW-DB")).resolve()
 RUNS = [
     {
-        "label": "SL-PPO u2 group+ref",
-        "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_R70_U2_E1000",
-        "color": "#1f77b4",
-        "linestyle": "-",
-    },
-    {
         "label": "SL-PPO u4 group+ref",
-        "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_R70_U4_E1000",
+        "run_name": "O2O_CUS15_SL_PPO_GROUP_REF_R40_U4_E1000",
         "color": "#4c78a8",
         "linestyle": "--",
     },
     {
-        "label": "DAPG u2",
-        "run_name": "O2O_CUS50_DAPG_R70_U2_E1000",
-        "color": "#d62728",
-        "linestyle": "-",
-    },
-    {
         "label": "DAPG u4",
-        "run_name": "O2O_CUS50_DAPG_R70_U4_E1000",
+        "run_name": "O2O_CUS15_DAPG_R40_U4_E1000",
         "color": "#f58518",
         "linestyle": "--",
     },
     {
         "label": "DAPG u4 + dyn",
-        "run_name": "O2O_CUS50_DAPG_DYN_R70_U4_E1000",
+        "run_name": "O2O_CUS15_DAPG_DYN_R40_U4_E1000",
         "color": "#9467bd",
         "linestyle": "-.",
     },
 ]
-GUROBI_VAL_SUMMARY = Path(os.environ.get("CUS50_GUROBI_VAL_SUMMARY", "/data/Maojie/gurobi_mul/results/val/Cus50/gurobi_summary.csv"))
-OUTPUT_STEM = "cus50_offline_update_ablation_r70_e1000"
-LEGACY_OUTPUT_STEM = "cus50_slppo_group_ref_vs_dapg_r70_u2_e1000"
+DEFAULT_GUROBI_VAL_SUMMARY = EVRPTW_DB_ROOT / "results/offline_experts/dataset_v1/val/Cus15_Gurobi_2h/gurobi_summary.csv"
+GUROBI_VAL_SUMMARY = Path(os.environ.get("CUS15_GUROBI_VAL_SUMMARY", str(DEFAULT_GUROBI_VAL_SUMMARY)))
+OUTPUT_STEM = "cus15_offline_dynamic_update_ablation_r40_e1000"
 
 
 def _float_or_nan(value: Any) -> float:
@@ -59,7 +48,7 @@ def _float_or_nan(value: Any) -> float:
 
 
 def read_eval_log(run_name: str) -> list[dict[str, float]]:
-    path = REPO_ROOT / "results" / "logs" / "Cus_50_CS_10" / run_name / f"seed_{SEED}" / "eval_log.csv"
+    path = REPO_ROOT / "results" / "logs" / "Cus_15_CS_3" / run_name / f"seed_{SEED}" / "eval_log.csv"
     if not path.exists():
         return []
     rows: list[dict[str, float]] = []
@@ -81,7 +70,8 @@ def gurobi_best_average() -> tuple[float, int]:
     values: list[float] = []
     with GUROBI_VAL_SUMMARY.open("r", newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            if str(row.get("feasible", "")).lower() not in {"true", "1", "yes"}:
+            feasible = str(row.get("feasible", "")).lower()
+            if feasible and feasible not in {"true", "1", "yes"}:
                 continue
             objective = _float_or_nan(row.get("objective_distance_km"))
             if np.isfinite(objective):
@@ -169,7 +159,7 @@ def main() -> None:
             label=f"Gurobi best avg ({gurobi_avg:.2f} km, n={gurobi_n})",
         )
 
-    ax.set_title("Cus50 Validation Objective: Offline-to-Online Dynamic/Update Ablation")
+    ax.set_title("Cus15 Validation Objective: Offline-to-Online Dynamic/Update Ablation")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Avg objective distance (km)")
     ax.set_xlim(0, 1000)
@@ -184,15 +174,9 @@ def main() -> None:
     pdf_path = fig_dir / f"{OUTPUT_STEM}.pdf"
     fig.savefig(png_path, bbox_inches="tight")
     fig.savefig(pdf_path, bbox_inches="tight")
-    legacy_png_path = fig_dir / f"{LEGACY_OUTPUT_STEM}.png"
-    legacy_pdf_path = fig_dir / f"{LEGACY_OUTPUT_STEM}.pdf"
-    fig.savefig(legacy_png_path, bbox_inches="tight")
-    fig.savefig(legacy_pdf_path, bbox_inches="tight")
     plt.close(fig)
     print(f"saved {png_path}")
     print(f"saved {pdf_path}")
-    print(f"saved {legacy_png_path}")
-    print(f"saved {legacy_pdf_path}")
 
 
 if __name__ == "__main__":

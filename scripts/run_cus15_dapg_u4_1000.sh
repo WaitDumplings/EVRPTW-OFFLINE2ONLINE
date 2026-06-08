@@ -11,13 +11,13 @@ EVRPTW_DB_ROOT="${EVRPTW_DB_ROOT:-/data/Maojie/EVRPTW-DB}"
 mkdir -p "$O2O_ROOT/results/launch_logs"
 export EVRPTW_DB_ROOT
 export PYTHONUNBUFFERED=1
-export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-cus50-offline-methods}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-cus15-offline-methods}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 cd "$O2O_ROOT"
 CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "$PYTHON_BIN" -m offline2online.train \
-  --config "$O2O_ROOT/ablation/configs/cus50_o2o_dapg_1000.yaml" \
+  --config "$O2O_ROOT/ablation/configs/cus15_o2o_dapg_u4_1000.yaml" \
   --seed "$SEED" \
   --device cuda \
   "$@" \
-  > "$O2O_ROOT/results/launch_logs/cus50_dapg_1000_seed_${SEED}.log" 2>&1
+  > "$O2O_ROOT/results/launch_logs/cus15_dapg_u4_1000_seed_${SEED}.log" 2>&1

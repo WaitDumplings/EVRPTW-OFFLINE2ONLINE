@@ -15,7 +15,7 @@ The main method is **SL-PPO**, a solution-level PPO auxiliary objective. Direct 
 By default the code reads EVRPTW-DB from:
 
 ```bash
-/data/Maojie/Github2/EVRPTW-DB
+/data/Maojie/EVRPTW-DB
 ```
 
 Override this location with:
@@ -50,7 +50,9 @@ Main configs live in `configs/`:
 - `cus5_o2o_ppo.yaml`: explicit PPO baseline.
 - `cus5_o2o_sl_ppo.yaml`: proposed solution-level SL-PPO, default reference advantage.
 - `cus15_o2o_sl_ppo.yaml`: Cus15 SL-PPO scaffold using a Cus15 solver archive.
+- `cus15_o2o_sl_ppo_group_ref_u4_1000.yaml`: Cus15 SL-PPO group + reference comparison run.
 - `cus50_o2o_sl_ppo_group_ref_1000.yaml`: Cus50 SL-PPO comparison run with group + reference route advantages.
+- `cus50_o2o_sl_ppo_group_ref_u4_1000.yaml`: Cus50 SL-PPO group + reference run with four PPO updates.
 
 Dynamic embedding is disabled by default. Graph token remains enabled. The trainer forces `env_fast` and supports AMP through `training.mixed_precision: true`.
 
@@ -94,6 +96,10 @@ Ablation-only configs and scripts live in `ablation/`:
 - `ablation/configs/cus5_o2o_bc_ppo.yaml`: BC warmup + PPO baseline.
 - `ablation/configs/cus5_o2o_dapg.yaml`: DAPG-style demonstration gradient baseline.
 - `ablation/configs/cus50_o2o_dapg_1000.yaml`: Cus50 DAPG comparison run with BC pretraining and DAPG fine-tuning.
+- `ablation/configs/cus15_o2o_dapg_u4_1000.yaml`: Cus15 DAPG run with four PPO updates.
+- `ablation/configs/cus15_o2o_dapg_u4_dyn_1000.yaml`: Cus15 DAPG run with candidate dynamic embedding enabled.
+- `ablation/configs/cus50_o2o_dapg_u4_1000.yaml`: Cus50 DAPG run with four PPO updates.
+- `ablation/configs/cus50_o2o_dapg_u4_dyn_1000.yaml`: Cus50 DAPG run with candidate dynamic embedding enabled.
 - `ablation/configs/cus5_o2o_route_bc_ppo.yaml`: route-level imitation baseline, the old implementation previously called SL-PPO.
 - `ablation/configs/cus5_o2o_ppo_group_adv.yaml`: PPO with step-level group advantage.
 - `ablation/configs/cus5_o2o_ppo_ref_adv.yaml`: PPO with step-level reference advantage.
@@ -114,17 +120,60 @@ Example:
 python -m offline2online.train --config ablation/configs/cus5_o2o_dapg.yaml --seed 2005 --epochs 1000
 ```
 
+## Portable Launch Scripts
+
+The launch scripts derive `O2O_ROOT` from the checked-out repository and use the current `python` by default. Override paths or devices without editing the scripts:
+
+```bash
+export EVRPTW_DB_ROOT=/path/to/EVRPTW-DB
+PYTHON_BIN=/path/to/python SEED=2005 CUDA_DEVICE=0 bash scripts/run_cus15_slppo_group_ref_u4_1000.sh
+```
+
+Additional trainer overrides can be appended to any launch script, for example:
+
+```bash
+bash scripts/run_cus15_dapg_u4_dyn_1000.sh --num-envs-per-gpu 320 --eval-limit 100
+```
+
+## Cus15 Comparison Helpers
+
+The Cus15 bundle is intended for reproducing the current update/dynamic comparison on another server. It uses seed `2005`, rollout/eval horizon `40`, four PPO updates, graph token and attention bias enabled, and PBRS disabled.
+
+```bash
+bash scripts/run_cus15_slppo_group_ref_u4_1000.sh
+bash scripts/run_cus15_dapg_u4_1000.sh
+bash scripts/run_cus15_dapg_u4_dyn_1000.sh
+bash scripts/watch_cus15_slppo_dapg_plot.sh
+```
+
+The Cus15 plot helper writes:
+
+```text
+results/figures/cus15_offline_dynamic_update_ablation_r40_e1000.png
+results/figures/cus15_offline_dynamic_update_ablation_r40_e1000.pdf
+results/cus15_offline_dynamic_update_ablation_r40_e1000_summary.csv
+```
+
+If the validation Gurobi summary is not at `EVRPTW_DB_ROOT/results/offline_experts/dataset_v1/val/Cus15_Gurobi_2h/gurobi_summary.csv`, set:
+
+```bash
+export CUS15_GUROBI_VAL_SUMMARY=/path/to/Cus15/val/gurobi_summary.csv
+```
+
 ## Cus50 Comparison Helpers
 
-The current Cus50 comparison uses the same seed, rollout length, PPO update count, graph token, and attention bias for SL-PPO and DAPG. Dynamic embedding is intentionally disabled in both configs.
+The current Cus50 comparison uses the same seed, rollout length, graph token, and attention bias for SL-PPO and DAPG. The checked-in helpers include u2, u4, and a DAPG u4 dynamic-embedding variant.
 
 ```bash
 bash scripts/run_cus50_slppo_group_ref_1000.sh
+bash scripts/run_cus50_slppo_group_ref_u4_1000.sh
 bash scripts/run_cus50_dapg_1000.sh
+bash scripts/run_cus50_dapg_u4_1000.sh
+bash scripts/run_cus50_dapg_u4_dyn_1000.sh
 bash scripts/watch_cus50_slppo_dapg_plot.sh
 ```
 
-The plot helper overlays SL-PPO, DAPG, and the validation-set Gurobi best average from `/data/Maojie/gurobi_mul/results/val/Cus50/gurobi_summary.csv`.
+The plot helper overlays SL-PPO, DAPG, and the validation-set Gurobi best average from `/data/Maojie/gurobi_mul/results/val/Cus50/gurobi_summary.csv`. Override that path with `CUS50_GUROBI_VAL_SUMMARY`.
 
 ## Outputs
 
