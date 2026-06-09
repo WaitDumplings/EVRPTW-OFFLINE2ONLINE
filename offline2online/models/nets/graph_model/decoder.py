@@ -383,9 +383,8 @@ class DynamicDecisionEncoder(nn.Module):
 
     The static encoder still owns the graph representation. This module builds a
     small set of per-step dynamic tokens from the feasible frontier, route memory,
-    current node and scalar vehicle state, then produces a query correction and a
-    candidate energy bias. The candidate path is scalar, so it adds online
-    expressiveness without another [B,T,N,3D] tensor.
+    current node and scalar vehicle state, then produces candidate-side dynamic
+    corrections for the decoder glimpse keys, glimpse values and logit keys.
     """
 
     def __init__(self, embedding_dim, n_heads=4, enabled=False):
@@ -420,38 +419,29 @@ class DynamicDecisionEncoder(nn.Module):
             nn.Linear(2 * embedding_dim, embedding_dim),
         )
         self.token_ff_norm = nn.LayerNorm(embedding_dim)
-        self.query_out = nn.Sequential(
-            nn.LayerNorm(3 * embedding_dim),
-            nn.Linear(3 * embedding_dim, embedding_dim),
-            nn.SiLU(),
-            nn.Linear(embedding_dim, embedding_dim),
-        )
-        self.energy_context_proj = nn.Sequential(
-            nn.LayerNorm(embedding_dim),
-            nn.Linear(embedding_dim, embedding_dim, bias=False),
-        )
-        self.node_energy_proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
-        self.candidate_bias = nn.Sequential(
+        self.node_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
+        self.decision_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
+        self.step_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
+        self.candidate_feature_proj = nn.Sequential(
             nn.LayerNorm(self.candidate_feature_dim),
-            nn.Linear(self.candidate_feature_dim, embedding_dim // 2),
+            nn.Linear(self.candidate_feature_dim, embedding_dim),
             nn.SiLU(),
-            nn.Linear(embedding_dim // 2, 1),
+            nn.Linear(embedding_dim, 3 * embedding_dim),
         )
-        self.query_scale = nn.Parameter(torch.tensor(0.1))
-        self.energy_scale = nn.Parameter(torch.tensor(0.0))
-        self.feature_bias_scale = nn.Parameter(torch.tensor(0.1))
+        self.candidate_scale = nn.Parameter(torch.tensor(0.1))
 
         nn.init.normal_(self.token_type, mean=0.0, std=0.02)
         nn.init.xavier_uniform_(self.state_proj[1].weight, gain=0.5)
         nn.init.zeros_(self.state_proj[1].bias)
         nn.init.xavier_uniform_(self.state_proj[3].weight, gain=0.5)
         nn.init.zeros_(self.state_proj[3].bias)
-        nn.init.xavier_uniform_(self.query_out[1].weight, gain=0.5)
-        nn.init.zeros_(self.query_out[1].bias)
-        nn.init.zeros_(self.query_out[3].weight)
-        nn.init.zeros_(self.query_out[3].bias)
-        nn.init.zeros_(self.candidate_bias[-1].weight)
-        nn.init.zeros_(self.candidate_bias[-1].bias)
+        nn.init.zeros_(self.node_state_proj.weight)
+        nn.init.zeros_(self.decision_state_proj.weight)
+        nn.init.zeros_(self.step_state_proj.weight)
+        nn.init.xavier_uniform_(self.candidate_feature_proj[1].weight, gain=0.5)
+        nn.init.zeros_(self.candidate_feature_proj[1].bias)
+        nn.init.zeros_(self.candidate_feature_proj[3].weight)
+        nn.init.zeros_(self.candidate_feature_proj[3].bias)
 
     @staticmethod
     def _step_count(state, fallback=1):
@@ -751,7 +741,7 @@ class DynamicDecisionEncoder(nn.Module):
         state,
     ):
         if not self.enabled:
-            return 0, 0
+            return 0, 0, 0
 
         T = self._step_count(state, fallback=step_context.size(1))
         graph_context = self._expand_step(graph_context, T)
@@ -851,15 +841,6 @@ class DynamicDecisionEncoder(nn.Module):
         flat_tokens = self.token_ff_norm(flat_tokens + self.token_ff(flat_tokens))
         decision_token = flat_tokens[:, 0, :].reshape(B, T, D)
 
-        query_delta = torch.tanh(self.query_scale) * self.query_out(
-            torch.cat([base_query, decision_token, state_token], dim=-1)
-        )
-
-        energy_context = self.energy_context_proj(decision_token)
-        node_energy = self.node_energy_proj(node_embeddings)
-        bilinear_bias = torch.einsum("btd,bnd->btn", energy_context, node_energy)
-        bilinear_bias = bilinear_bias / (float(D) ** 0.5)
-
         candidate_features = self._candidate_features(
             state=state,
             node_embeddings=node_embeddings,
@@ -874,12 +855,13 @@ class DynamicDecisionEncoder(nn.Module):
             current_node_idx=current_node_idx,
             prev_node_idx=prev_node_idx,
         )
-        feature_bias = self.candidate_bias(candidate_features).squeeze(-1)
-        logit_bias = (
-            torch.tanh(self.energy_scale) * bilinear_bias
-            + torch.tanh(self.feature_bias_scale) * feature_bias
-        )
-        return query_delta, logit_bias
+        candidate_delta = self.candidate_feature_proj(candidate_features)
+        candidate_delta = candidate_delta + self.node_state_proj(node_embeddings).unsqueeze(1)
+        candidate_delta = candidate_delta + self.decision_state_proj(decision_token).unsqueeze(2)
+        candidate_delta = candidate_delta + self.step_state_proj(state_token).unsqueeze(2)
+        candidate_delta = torch.tanh(self.candidate_scale) * candidate_delta
+        key_delta, value_delta, logit_delta = candidate_delta.chunk(3, dim=-1)
+        return key_delta, value_delta, logit_delta
 
 
 class Decoder(nn.Module):
@@ -1040,7 +1022,7 @@ class Decoder(nn.Module):
             dynamic_context=dynamic_context,
             state=state,
         )
-        decision_query_delta, decision_logit_bias = self.dynamic_decision_encoder(
+        decision_key_delta, decision_val_delta, decision_logit_delta = self.dynamic_decision_encoder(
             node_embeddings=node_embeddings,
             graph_context=graph_context,
             step_context=step_context,
@@ -1052,31 +1034,46 @@ class Decoder(nn.Module):
             + step_context
             + dynamic_context
             + structured_query_delta
-            + decision_query_delta
         )
 
         # dynamic node-wise modifiers
         glimpse_key_dynamic, glimpse_val_dynamic, logit_key_dynamic = self.dynamic_embedding(state)
-        if torch.is_tensor(glimpse_key_dynamic) and glimpse_key_dynamic.dim() == 4:
-            glimpse_K = (
-                glimpse_K.unsqueeze(1)
-                + glimpse_key_dynamic
-                + structured_key_delta
-            )
-            glimpse_V = (
-                glimpse_V.unsqueeze(1)
-                + glimpse_val_dynamic
-                + structured_val_delta
-            )
-            logit_K = (
-                logit_K.unsqueeze(1)
-                + logit_key_dynamic
-                + structured_logit_delta
-            )
-        elif structured_key_delta.dim() == 4:
-            glimpse_K = glimpse_K.unsqueeze(1) + structured_key_delta
-            glimpse_V = glimpse_V.unsqueeze(1) + structured_val_delta
-            logit_K = logit_K.unsqueeze(1) + structured_logit_delta
+        has_stepwise_candidate_delta = (
+            (torch.is_tensor(glimpse_key_dynamic) and glimpse_key_dynamic.dim() == 4)
+            or structured_key_delta.dim() == 4
+            or (torch.is_tensor(decision_key_delta) and decision_key_delta.dim() == 4)
+        )
+
+        if has_stepwise_candidate_delta:
+            glimpse_K = glimpse_K.unsqueeze(1)
+            glimpse_V = glimpse_V.unsqueeze(1)
+            logit_K = logit_K.unsqueeze(1)
+
+            if torch.is_tensor(glimpse_key_dynamic):
+                if glimpse_key_dynamic.dim() == 3:
+                    glimpse_key_dynamic = glimpse_key_dynamic.unsqueeze(1)
+                    glimpse_val_dynamic = glimpse_val_dynamic.unsqueeze(1)
+                    logit_key_dynamic = logit_key_dynamic.unsqueeze(1)
+                glimpse_K = glimpse_K + glimpse_key_dynamic
+                glimpse_V = glimpse_V + glimpse_val_dynamic
+                logit_K = logit_K + logit_key_dynamic
+
+            if structured_key_delta.dim() == 3:
+                structured_key_delta = structured_key_delta.unsqueeze(1)
+                structured_val_delta = structured_val_delta.unsqueeze(1)
+                structured_logit_delta = structured_logit_delta.unsqueeze(1)
+            glimpse_K = glimpse_K + structured_key_delta
+            glimpse_V = glimpse_V + structured_val_delta
+            logit_K = logit_K + structured_logit_delta
+
+            if torch.is_tensor(decision_key_delta):
+                if decision_key_delta.dim() == 3:
+                    decision_key_delta = decision_key_delta.unsqueeze(1)
+                    decision_val_delta = decision_val_delta.unsqueeze(1)
+                    decision_logit_delta = decision_logit_delta.unsqueeze(1)
+                glimpse_K = glimpse_K + decision_key_delta
+                glimpse_V = glimpse_V + decision_val_delta
+                logit_K = logit_K + decision_logit_delta
         else:
             structured_key_delta = structured_key_delta.squeeze(1)
             structured_val_delta = structured_val_delta.squeeze(1)
@@ -1084,6 +1081,10 @@ class Decoder(nn.Module):
             glimpse_K = glimpse_K + glimpse_key_dynamic + structured_key_delta
             glimpse_V = glimpse_V + glimpse_val_dynamic + structured_val_delta
             logit_K = logit_K + logit_key_dynamic + structured_logit_delta
+            if torch.is_tensor(decision_key_delta):
+                glimpse_K = glimpse_K + decision_key_delta
+                glimpse_V = glimpse_V + decision_val_delta
+                logit_K = logit_K + decision_logit_delta
 
         # base feasibility mask from env, over real nodes only
         mask = state.get_mask()   # [B,N]
@@ -1100,8 +1101,6 @@ class Decoder(nn.Module):
             logit_K=logit_K,
             mask=mask,
         )
-        if torch.is_tensor(decision_logit_bias):
-            logits = logits + decision_logit_bias.to(device=logits.device, dtype=logits.dtype)
         return logits, glimpse
 
     def calc_logits(self, query, glimpse_K, glimpse_V, logit_K, mask):
