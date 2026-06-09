@@ -382,8 +382,8 @@ class DynamicDecisionEncoder(nn.Module):
     Lightweight online-state encoder for the decoder.
 
     The static encoder still owns the graph representation. This module builds a
-    small set of per-step dynamic tokens from the feasible frontier, route memory,
-    current node and scalar vehicle state, then produces candidate-side dynamic
+    small set of per-step dynamic tokens from routing-generic state summaries and
+    problem-specific constraint margins, then produces candidate-side dynamic
     corrections for the decoder glimpse keys and values. Pointer logit keys are
     left to the static projection, candidate dynamic embedding and structured
     fusion paths so this adapter has a clean key/value-only boundary.
@@ -393,8 +393,16 @@ class DynamicDecisionEncoder(nn.Module):
         super().__init__()
         self.embedding_dim = int(embedding_dim)
         self.enabled = bool(enabled)
-        self.system_feature_dim = 12
-        self.candidate_feature_dim = 24
+        self.routing_system_feature_dim = 10
+        self.problem_system_feature_dim = 5
+        self.system_feature_dim = (
+            self.routing_system_feature_dim + self.problem_system_feature_dim
+        )
+        self.routing_candidate_feature_dim = 16
+        self.problem_candidate_feature_dim = 14
+        self.candidate_feature_dim = (
+            self.routing_candidate_feature_dim + self.problem_candidate_feature_dim
+        )
         self.num_tokens = 9
 
         n_heads = max(1, int(n_heads))
@@ -548,32 +556,34 @@ class DynamicDecisionEncoder(nn.Module):
         route_mask,
         current_node_idx,
     ):
+        dtype = node_embeddings.dtype
         feasible_customer_ratio = (
-            (action_mask & customer_mask).to(node_embeddings.dtype).sum(-1, keepdim=True)
-            / customer_mask.to(node_embeddings.dtype).sum(-1, keepdim=True).clamp_min(1.0)
+            (action_mask & customer_mask).to(dtype).sum(-1, keepdim=True)
+            / customer_mask.to(dtype).sum(-1, keepdim=True).clamp_min(1.0)
         )
         feasible_rs_ratio = (
-            (action_mask & rs_mask).to(node_embeddings.dtype).sum(-1, keepdim=True)
-            / rs_mask.to(node_embeddings.dtype).sum(-1, keepdim=True).clamp_min(1.0)
+            (action_mask & rs_mask).to(dtype).sum(-1, keepdim=True)
+            / rs_mask.to(dtype).sum(-1, keepdim=True).clamp_min(1.0)
         )
-        depot_feasible = (action_mask & depot_mask).to(node_embeddings.dtype).sum(
-            -1, keepdim=True
-        ).clamp(max=1.0)
-        current_is_rs = torch.gather(
-            rs_mask.to(node_embeddings.dtype),
+        depot_feasible = (action_mask & depot_mask).to(dtype).sum(-1, keepdim=True).clamp(max=1.0)
+        current_is_depot = torch.gather(
+            depot_mask.to(dtype),
+            dim=2,
+            index=current_node_idx.unsqueeze(-1),
+        )
+        current_is_customer = torch.gather(
+            customer_mask.to(dtype),
             dim=2,
             index=current_node_idx.unsqueeze(-1),
         )
         route_len_ratio = (
-            route_mask.to(node_embeddings.dtype).sum(dim=-1, keepdim=True)
+            route_mask.to(dtype).sum(dim=-1, keepdim=True)
             / float(max(node_embeddings.size(1), 1))
         )
+        route_is_empty = (route_len_ratio <= 1e-6).to(dtype)
 
-        return torch.cat(
+        routing_core = torch.cat(
             [
-                self._as_step_scalar(state.states.get("current_load"), T, node_embeddings),
-                self._as_step_scalar(state.states.get("current_battery"), T, node_embeddings),
-                self._as_step_scalar(state.states.get("current_time"), T, node_embeddings),
                 self._as_step_scalar(
                     state.states.get("visited_customers_ratio"), T, node_embeddings
                 ),
@@ -585,15 +595,32 @@ class DynamicDecisionEncoder(nn.Module):
                 self._as_step_scalar(
                     state.states.get("route_served_customers_ratio"), T, node_embeddings
                 ),
-                self._as_step_scalar(state.states.get("rs_streak_ratio"), T, node_embeddings),
                 depot_feasible,
                 feasible_customer_ratio,
                 feasible_rs_ratio,
-                current_is_rs,
+                current_is_depot,
+                current_is_customer,
                 route_len_ratio,
+                route_is_empty,
             ],
             dim=-1,
         )
+        current_is_rs = torch.gather(
+            rs_mask.to(dtype),
+            dim=2,
+            index=current_node_idx.unsqueeze(-1),
+        )
+        constraint_context = torch.cat(
+            [
+                self._as_step_scalar(state.states.get("current_load"), T, node_embeddings),
+                self._as_step_scalar(state.states.get("current_battery"), T, node_embeddings),
+                self._as_step_scalar(state.states.get("current_time"), T, node_embeddings),
+                current_is_rs,
+                self._as_step_scalar(state.states.get("rs_streak_ratio"), T, node_embeddings),
+            ],
+            dim=-1,
+        )
+        return torch.cat([routing_core, constraint_context], dim=-1)
 
     def _candidate_features(
         self,
@@ -628,6 +655,20 @@ class DynamicDecisionEncoder(nn.Module):
         )
         rel = node_loc.to(device=device, dtype=dtype).unsqueeze(1) - current_loc.unsqueeze(2)
         travel_proxy = torch.linalg.norm(rel, dim=-1).clamp(min=0.0) / (2.0 ** 0.5)
+        depot_step_loc = node_loc[:, :1, :].to(device=device, dtype=dtype)
+        return_to_depot = torch.linalg.norm(
+            node_loc.to(device=device, dtype=dtype).unsqueeze(1)
+            - depot_step_loc.unsqueeze(2),
+            dim=-1,
+        ).clamp(min=0.0) / (2.0 ** 0.5)
+        if return_to_depot.size(1) == 1 and T != 1:
+            return_to_depot = return_to_depot.expand(-1, T, -1)
+        current_to_depot = torch.linalg.norm(
+            current_loc - depot_step_loc,
+            dim=-1,
+            keepdim=True,
+        ).clamp(min=0.0) / (2.0 ** 0.5)
+        depot_detour = travel_proxy + return_to_depot - current_to_depot
 
         edge_energy = state.states.get("edge_energy", None)
         if edge_energy is None:
@@ -667,6 +708,7 @@ class DynamicDecisionEncoder(nn.Module):
         finish_slack = tw_close - finish
         load_after = current_load + demand_step
         battery_after = current_battery + energy_cost
+        capacity_margin = (1.0 - load_after).clamp(-1.0, 1.0)
 
         battery_capacity = state.states.get("battery_capacity", None)
         if battery_capacity is None:
@@ -685,6 +727,7 @@ class DynamicDecisionEncoder(nn.Module):
         battery_capacity = battery_capacity.clamp_min(1e-6)
         energy_ratio = (energy_cost / battery_capacity).clamp(0.0, 2.0)
         current_battery_feasible = (battery_after <= battery_capacity).to(dtype)
+        battery_margin = (1.0 - battery_after).clamp(-1.0, 1.0)
 
         node_ids = torch.arange(N, device=device).view(1, 1, N)
         current_candidate = node_ids == current_node_idx.unsqueeze(-1)
@@ -705,7 +748,7 @@ class DynamicDecisionEncoder(nn.Module):
         ).clamp(0.0, 1.0)
         repeated_rs_candidate = (visit_norm > 0).to(dtype) * rs_mask.to(dtype)
 
-        return torch.stack(
+        routing_core = torch.stack(
             [
                 action_mask.to(dtype),
                 (~action_mask).to(dtype),
@@ -718,15 +761,26 @@ class DynamicDecisionEncoder(nn.Module):
                 route_order_clamped,
                 current_candidate.to(dtype),
                 prev_candidate.to(dtype),
+                (prev_candidate & rs_mask).to(dtype),
                 travel_proxy.clamp(0.0, 2.0),
+                return_to_depot.clamp(0.0, 2.0),
+                depot_detour.clamp(-1.0, 2.0),
+                (action_mask & unvisited_customer).to(dtype),
+            ],
+            dim=-1,
+        )
+        constraint_supplement = torch.stack(
+            [
+                demand_step,
+                load_after.clamp(0.0, 2.0),
+                capacity_margin,
                 energy_ratio,
                 arrival.clamp(0.0, 2.0),
                 wait.clamp(0.0, 1.0),
                 arrival_slack.clamp(-1.0, 1.0),
                 finish_slack.clamp(-1.0, 1.0),
-                demand_step,
-                load_after.clamp(0.0, 2.0),
                 battery_after.clamp(0.0, 2.0),
+                battery_margin,
                 current_battery_feasible,
                 route_served_ratio.expand(B, T, N),
                 no_customer_route.expand(B, T, N),
@@ -734,6 +788,7 @@ class DynamicDecisionEncoder(nn.Module):
             ],
             dim=-1,
         )
+        return torch.cat([routing_core, constraint_supplement], dim=-1)
 
     def forward(
         self,

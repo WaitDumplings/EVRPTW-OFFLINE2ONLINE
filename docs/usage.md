@@ -45,9 +45,12 @@ Default model/training choices:
 
 - Dynamic embedding is off by default.
 - Graph token remains on by default.
+- Dynamic Decision Encoder is off by default. When enabled, it is a key/value-only decoder adapter whose inputs are separated into a routing-generic core and an EVRPTW constraint supplement.
 - The trainer and offline route replay force the fast EVRPTW environment.
 - PPO uses GAE by default: `training.use_gae: true`, `training.gae_lambda: 0.95`.
 - Mixed precision is enabled on CUDA when `training.mixed_precision: true`.
+
+The DDE routing core uses action feasibility, node type, route membership, visit/order memory, current/previous candidate flags, current-to-candidate cost, return-to-depot cost, and depot-detour cost. The EVRPTW supplement adds load, battery, time-window, waiting, service-finish, and charging-station repeat margins. Other routing problems can keep the routing core and replace or extend only the supplement.
 
 ## 3. Ablation Methods
 

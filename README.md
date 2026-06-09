@@ -56,6 +56,13 @@ Main configs live in `configs/`:
 
 Dynamic embedding is disabled by default. Graph token remains enabled. The trainer forces `env_fast` and supports AMP through `training.mixed_precision: true`.
 
+The optional Dynamic Decision Encoder (`model.use_dynamic_decision_encoder: true`) is implemented as a key/value-only decoder adapter. Its input schema is split into a routing-generic core and an EVRPTW constraint supplement:
+
+- Routing core: feasible frontier state, depot/customer/auxiliary node type, route membership, visit/order memory, current/previous candidate flags, current-to-candidate cost, return-to-depot cost, and depot-detour cost.
+- EVRPTW supplement: load, battery, time-window, waiting, service-finish, and charging-station repeat margins.
+
+This keeps the DDE reusable for other routing variants while allowing problem-specific constraints to be added as supplements.
+
 ## SL-PPO Semantics
 
 The proposed `offline.method: sl_ppo` does not imitate solver actions. It uses current on-policy rollout trajectories and adds a solution-level clipped PPO objective:
