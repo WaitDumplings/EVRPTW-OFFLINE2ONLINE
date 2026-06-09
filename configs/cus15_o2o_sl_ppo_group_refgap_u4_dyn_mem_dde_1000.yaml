@@ -1,4 +1,4 @@
-run_name: O2O_CUS15_SL_PPO_GROUP_REFGAP_MEM_DYN_DDE_R40_U4_E1000
+run_name: O2O_CUS15_SL_PPO_GROUP_REFGAP_MEM_DYN_DDE_KV_R40_U4_E1000
 dataset_name: EVRPTW-D_Geo-AC-v1
 data:
   generator_config: configs/amazon_hierarchy.yaml

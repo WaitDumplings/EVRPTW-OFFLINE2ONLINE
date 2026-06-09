@@ -384,7 +384,9 @@ class DynamicDecisionEncoder(nn.Module):
     The static encoder still owns the graph representation. This module builds a
     small set of per-step dynamic tokens from the feasible frontier, route memory,
     current node and scalar vehicle state, then produces candidate-side dynamic
-    corrections for the decoder glimpse keys, glimpse values and logit keys.
+    corrections for the decoder glimpse keys and values. Pointer logit keys are
+    left to the static projection, candidate dynamic embedding and structured
+    fusion paths so this adapter has a clean key/value-only boundary.
     """
 
     def __init__(self, embedding_dim, n_heads=4, enabled=False):
@@ -419,16 +421,17 @@ class DynamicDecisionEncoder(nn.Module):
             nn.Linear(2 * embedding_dim, embedding_dim),
         )
         self.token_ff_norm = nn.LayerNorm(embedding_dim)
-        self.node_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
-        self.decision_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
-        self.step_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
+        self.node_state_proj = nn.Linear(embedding_dim, 2 * embedding_dim, bias=False)
+        self.decision_state_proj = nn.Linear(embedding_dim, 2 * embedding_dim, bias=False)
+        self.step_state_proj = nn.Linear(embedding_dim, 2 * embedding_dim, bias=False)
         self.candidate_feature_proj = nn.Sequential(
             nn.LayerNorm(self.candidate_feature_dim),
             nn.Linear(self.candidate_feature_dim, embedding_dim),
             nn.SiLU(),
-            nn.Linear(embedding_dim, 3 * embedding_dim),
+            nn.Linear(embedding_dim, 2 * embedding_dim),
         )
-        self.candidate_scale = nn.Parameter(torch.tensor(0.1))
+        self.key_scale = nn.Parameter(torch.tensor(0.1))
+        self.value_scale = nn.Parameter(torch.tensor(0.1))
 
         nn.init.normal_(self.token_type, mean=0.0, std=0.02)
         nn.init.xavier_uniform_(self.state_proj[1].weight, gain=0.5)
@@ -741,7 +744,7 @@ class DynamicDecisionEncoder(nn.Module):
         state,
     ):
         if not self.enabled:
-            return 0, 0, 0
+            return 0, 0
 
         T = self._step_count(state, fallback=step_context.size(1))
         graph_context = self._expand_step(graph_context, T)
@@ -859,9 +862,10 @@ class DynamicDecisionEncoder(nn.Module):
         candidate_delta = candidate_delta + self.node_state_proj(node_embeddings).unsqueeze(1)
         candidate_delta = candidate_delta + self.decision_state_proj(decision_token).unsqueeze(2)
         candidate_delta = candidate_delta + self.step_state_proj(state_token).unsqueeze(2)
-        candidate_delta = torch.tanh(self.candidate_scale) * candidate_delta
-        key_delta, value_delta, logit_delta = candidate_delta.chunk(3, dim=-1)
-        return key_delta, value_delta, logit_delta
+        key_delta, value_delta = candidate_delta.chunk(2, dim=-1)
+        key_delta = torch.tanh(self.key_scale) * key_delta
+        value_delta = torch.tanh(self.value_scale) * value_delta
+        return key_delta, value_delta
 
 
 class Decoder(nn.Module):
@@ -1022,7 +1026,7 @@ class Decoder(nn.Module):
             dynamic_context=dynamic_context,
             state=state,
         )
-        decision_key_delta, decision_val_delta, decision_logit_delta = self.dynamic_decision_encoder(
+        decision_key_delta, decision_val_delta = self.dynamic_decision_encoder(
             node_embeddings=node_embeddings,
             graph_context=graph_context,
             step_context=step_context,
@@ -1070,10 +1074,8 @@ class Decoder(nn.Module):
                 if decision_key_delta.dim() == 3:
                     decision_key_delta = decision_key_delta.unsqueeze(1)
                     decision_val_delta = decision_val_delta.unsqueeze(1)
-                    decision_logit_delta = decision_logit_delta.unsqueeze(1)
                 glimpse_K = glimpse_K + decision_key_delta
                 glimpse_V = glimpse_V + decision_val_delta
-                logit_K = logit_K + decision_logit_delta
         else:
             structured_key_delta = structured_key_delta.squeeze(1)
             structured_val_delta = structured_val_delta.squeeze(1)
@@ -1084,7 +1086,6 @@ class Decoder(nn.Module):
             if torch.is_tensor(decision_key_delta):
                 glimpse_K = glimpse_K + decision_key_delta
                 glimpse_V = glimpse_V + decision_val_delta
-                logit_K = logit_K + decision_logit_delta
 
         # base feasibility mask from env, over real nodes only
         mask = state.get_mask()   # [B,N]

@@ -11,7 +11,7 @@ CUDA_DEVICE="${CUDA_DEVICE:-0}"
 
 DYN_SESSION="cus50_slppo_group_ref_u4_dyn_1000"
 MEM_SESSION="cus50_slppo_group_ref_u4_dyn_mem_1000"
-DDE_SESSION="cus50_slppo_group_ref_u4_dyn_mem_dde_1000"
+DDE_SESSION="cus50_slppo_group_ref_u4_dyn_mem_dde_kv_1000"
 
 DYN_EVAL="$O2O_ROOT/results/logs/Cus_50_CS_10/O2O_CUS50_SL_PPO_GROUP_REF_DYN_R70_U4_E1000/seed_${SEED}/eval_log.csv"
 MEM_EVAL="$O2O_ROOT/results/logs/Cus_50_CS_10/O2O_CUS50_SL_PPO_GROUP_REF_MEM_DYN_R70_U4_E1000/seed_${SEED}/eval_log.csv"
