@@ -990,7 +990,6 @@ def train_from_config(
                 route_adv_tensor = None
                 route_success_tensor = None
                 if sl_enabled:
-                    _update_policy_best_objectives(policy_best_objectives, batch, envs)
                     route_adv_tensor, route_success_tensor, adv_info = _solution_level_advantage_tensors(
                         batch,
                         cfg,
@@ -999,6 +998,9 @@ def train_from_config(
                         device,
                         policy_best_objectives=policy_best_objectives,
                     )
+                    # Gate the current batch with historical policy memory only;
+                    # the current rollout becomes memory for subsequent epochs.
+                    _update_policy_best_objectives(policy_best_objectives, batch, envs)
                 else:
                     advantages, adv_info = _apply_auxiliary_advantages(
                         advantages,
