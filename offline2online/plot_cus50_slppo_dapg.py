@@ -16,21 +16,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SEED = int(os.environ.get("SEED", "2005"))
 RUNS = [
     {
-        "label": "SL-PPO u2 group+ref",
-        "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_R70_U2_E1000",
-        "color": "#1f77b4",
-        "linestyle": "-",
-    },
-    {
         "label": "SL-PPO u4 group+ref",
         "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_R70_U4_E1000",
         "color": "#4c78a8",
         "linestyle": "--",
     },
     {
-        "label": "DAPG u2",
-        "run_name": "O2O_CUS50_DAPG_R70_U2_E1000",
-        "color": "#d62728",
+        "label": "SL-PPO u4 group+ref + dyn",
+        "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_DYN_R70_U4_E1000",
+        "color": "#72b7b2",
+        "linestyle": "-.",
+    },
+    {
+        "label": "SL-PPO u4 group+ref + dyn + mem-gate",
+        "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_MEM_DYN_R70_U4_E1000",
+        "color": "#59a14f",
+        "linestyle": ":",
+    },
+    {
+        "label": "SL-PPO u4 group+ref-gap + dyn + mem-gate + DDE",
+        "run_name": "O2O_CUS50_SL_PPO_GROUP_REFGAP_MEM_DYN_DDE_R70_U4_E1000",
+        "color": "#e45756",
         "linestyle": "-",
     },
     {
@@ -173,6 +179,7 @@ def main() -> None:
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Avg objective distance (km)")
     ax.set_xlim(0, 1000)
+    ax.set_ylim(150, 280)
     if not has_curve and np.isfinite(gurobi_avg):
         ax.set_ylim(max(0.0, gurobi_avg - 20.0), gurobi_avg + 80.0)
     ax.grid(True, alpha=0.3)

@@ -171,13 +171,19 @@ def _advantage_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "group_adv_std_floor",
         "group_infeasible_penalty",
         "use_reference_advantage",
+        "reference_advantage_mode",
         "reference_adv_coef",
         "reference_adv_rho",
         "reference_adv_clip",
         "reference_success_only",
+        "reference_gap_baseline",
+        "reference_gap_floor_ratio",
         "use_reference_soft_gate",
         "reference_soft_gate_eta",
         "reference_policy_estimate",
+        "use_reference_memory_gate",
+        "reference_memory_gate_eta",
+        "reference_memory_margin",
         "renormalize_after_aux_advantage",
     ):
         if key in offline_cfg and key not in adv_cfg:
@@ -185,9 +191,12 @@ def _advantage_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if _is_sl_ppo_method(method):
         adv_cfg.setdefault("use_reference_advantage", True)
         adv_cfg.setdefault("reference_adv_coef", 0.10)
+        adv_cfg.setdefault("reference_advantage_mode", "absolute")
         adv_cfg.setdefault("reference_adv_rho", 0.10)
         adv_cfg.setdefault("reference_adv_clip", 2.0)
         adv_cfg.setdefault("reference_success_only", True)
+        adv_cfg.setdefault("reference_gap_baseline", "mean")
+        adv_cfg.setdefault("reference_gap_floor_ratio", 0.01)
         adv_cfg.setdefault("use_reference_soft_gate", True)
         adv_cfg.setdefault("reference_soft_gate_eta", 0.05)
         adv_cfg.setdefault("reference_policy_estimate", "best")
@@ -240,11 +249,44 @@ def _final_info_arrays(final_infos: list[dict[str, Any]], num_envs: int, n_traj:
     return objective, success, served
 
 
+def _update_policy_best_objectives(
+    policy_best_objectives: dict[str, float],
+    batch,
+    envs,
+) -> None:
+    num_envs = int(batch.actions.size(1))
+    n_traj = int(batch.actions.size(2))
+    objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
+    for env_idx, env in enumerate(envs[:num_envs]):
+        instance_id = _env_instance_id(env)
+        if instance_id is None:
+            continue
+        successful = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
+        if successful.size == 0:
+            continue
+        current_best = float(np.min(successful))
+        previous_best = policy_best_objectives.get(instance_id)
+        if previous_best is None or current_best < previous_best:
+            policy_best_objectives[instance_id] = current_best
+
+
 def _finite_mean_std(value: np.ndarray) -> tuple[float, float]:
     finite = value[np.isfinite(value)]
     if finite.size == 0:
         return 0.0, 0.0
     return float(finite.mean()), float(finite.std())
+
+
+def _objective_baseline(values: np.ndarray, mode: str) -> float:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    mode = str(mode).lower()
+    if mode in {"best", "min", "minimum"}:
+        return float(np.min(finite))
+    if mode in {"median", "p50"}:
+        return float(np.median(finite))
+    return float(np.mean(finite))
 
 
 def _compute_gae_returns(batch, gamma: float, gae_lambda: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -345,6 +387,7 @@ def _solution_level_advantage_tensors(
     envs,
     expert_buffer: ExpertReplayBuffer | None,
     device: str | torch.device,
+    policy_best_objectives: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     adv_cfg = _advantage_config(cfg)
     use_group = _group_advantage_enabled(cfg)
@@ -360,6 +403,11 @@ def _solution_level_advantage_tensors(
         "ref_adv_std": 0.0,
         "ref_gate_mean": 0.0,
         "ref_gate_std": 0.0,
+        "ref_memory_gate_mean": 0.0,
+        "ref_memory_gate_std": 0.0,
+        "ref_memory_better_rate": 0.0,
+        "ref_memory_gap_mean": 0.0,
+        "ref_base_gap_ratio_mean": 0.0,
         "route_adv_mean": 0.0,
         "route_adv_std": 0.0,
     }
@@ -386,23 +434,56 @@ def _solution_level_advantage_tensors(
         ref_coef = float(adv_cfg.get("reference_adv_coef", 0.10))
         ref_rho = max(float(adv_cfg.get("reference_adv_rho", 0.10)), 1e-8)
         success_only = bool(adv_cfg.get("reference_success_only", True))
+        ref_mode = str(adv_cfg.get("reference_advantage_mode", "absolute")).lower()
+        gap_baseline_mode = str(adv_cfg.get("reference_gap_baseline", "mean")).lower()
+        gap_floor_ratio = max(float(adv_cfg.get("reference_gap_floor_ratio", 0.01)), 0.0)
         use_gate = bool(adv_cfg.get("use_reference_soft_gate", True))
         gate_eta = max(float(adv_cfg.get("reference_soft_gate_eta", 0.05)), 1e-8)
         estimate_mode = str(adv_cfg.get("reference_policy_estimate", "best")).lower()
+        use_memory_gate = bool(adv_cfg.get("use_reference_memory_gate", False))
+        memory_gate_eta = max(float(adv_cfg.get("reference_memory_gate_eta", gate_eta)), 1e-8)
+        memory_margin = max(float(adv_cfg.get("reference_memory_margin", 0.0)), 0.0)
         ref_adv = np.zeros((num_envs, n_traj), dtype=np.float64)
         gate = np.ones((num_envs, 1), dtype=np.float64)
+        memory_gate = np.ones((num_envs, 1), dtype=np.float64)
+        memory_better = np.zeros((num_envs, 1), dtype=np.float64)
+        memory_gaps: list[float] = []
+        base_gap_ratios: list[float] = []
         for env_idx, env in enumerate(envs[:num_envs]):
-            ref_obj = expert_buffer.reference_objective(_env_instance_id(env))
+            instance_id = _env_instance_id(env)
+            ref_obj = expert_buffer.reference_objective(instance_id)
             if ref_obj is None or not np.isfinite(ref_obj) or ref_obj <= 0.0:
                 ref_adv[env_idx] = 0.0
                 gate[env_idx, 0] = 0.0
+                memory_gate[env_idx, 0] = 0.0
                 continue
-            row = (float(ref_obj) - objective[env_idx]) / max(ref_rho * float(ref_obj), 1e-8)
-            row[~np.isfinite(row)] = 0.0
-            if success_only:
-                row = np.where(success[env_idx], row, 0.0)
-            ref_adv[env_idx] = np.clip(row, -ref_clip, ref_clip)
-            if use_gate:
+            succ_mask = success[env_idx] & np.isfinite(objective[env_idx])
+            succ_obj = objective[env_idx][succ_mask]
+            if ref_mode in {"gap", "gap_reduction", "remaining_gap", "remaining-gap"}:
+                if succ_obj.size == 0:
+                    ref_adv[env_idx] = 0.0
+                    gate[env_idx, 0] = 0.0
+                else:
+                    base_obj = _objective_baseline(succ_obj, gap_baseline_mode)
+                    remaining_gap = float(base_obj) - float(ref_obj)
+                    base_gap_ratio = remaining_gap / max(float(ref_obj), 1e-8)
+                    base_gap_ratios.append(float(base_gap_ratio))
+                    gap_floor = gap_floor_ratio * float(ref_obj)
+                    denom = max(remaining_gap, gap_floor, 1e-8)
+                    row = (float(base_obj) - objective[env_idx]) / denom
+                    row[~np.isfinite(row)] = 0.0
+                    if success_only:
+                        row = np.where(success[env_idx], row, 0.0)
+                    ref_adv[env_idx] = np.clip(row, -ref_clip, ref_clip)
+                    if use_gate:
+                        gate[env_idx, 0] = float(np.clip(base_gap_ratio / gate_eta, 0.0, 1.0))
+            else:
+                row = (float(ref_obj) - objective[env_idx]) / max(ref_rho * float(ref_obj), 1e-8)
+                row[~np.isfinite(row)] = 0.0
+                if success_only:
+                    row = np.where(success[env_idx], row, 0.0)
+                ref_adv[env_idx] = np.clip(row, -ref_clip, ref_clip)
+            if use_gate and ref_mode not in {"gap", "gap_reduction", "remaining_gap", "remaining-gap"}:
                 succ_obj = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
                 if succ_obj.size == 0:
                     estimate_obj = np.inf
@@ -412,11 +493,28 @@ def _solution_level_advantage_tensors(
                     estimate_obj = float(np.min(succ_obj))
                 gap = (estimate_obj - float(ref_obj)) / max(float(ref_obj), 1e-8)
                 gate[env_idx, 0] = float(np.clip(gap / gate_eta, 0.0, 1.0)) if np.isfinite(gap) else 1.0
-        ref_used = ref_adv * gate
+            if use_memory_gate and policy_best_objectives is not None and instance_id is not None:
+                memory_obj = policy_best_objectives.get(instance_id)
+                if memory_obj is not None and np.isfinite(memory_obj) and memory_obj > 0.0:
+                    target_obj = float(ref_obj) * (1.0 - memory_margin)
+                    memory_gap = (float(memory_obj) - target_obj) / max(float(ref_obj), 1e-8)
+                    memory_gaps.append(float(memory_gap))
+                    memory_gate[env_idx, 0] = float(np.clip(memory_gap / memory_gate_eta, 0.0, 1.0))
+                    if float(memory_obj) <= target_obj:
+                        memory_better[env_idx, 0] = 1.0
+        combined_gate = gate * memory_gate if use_memory_gate else gate
+        ref_used = ref_adv * combined_gate
         ref_used *= ref_coef
         route_adv += ref_used
         info["ref_adv_mean"], info["ref_adv_std"] = _finite_mean_std(ref_used)
-        info["ref_gate_mean"], info["ref_gate_std"] = _finite_mean_std(gate)
+        info["ref_gate_mean"], info["ref_gate_std"] = _finite_mean_std(combined_gate)
+        if base_gap_ratios:
+            info["ref_base_gap_ratio_mean"] = float(np.mean(base_gap_ratios))
+        if use_memory_gate:
+            info["ref_memory_gate_mean"], info["ref_memory_gate_std"] = _finite_mean_std(memory_gate)
+            info["ref_memory_better_rate"] = float(memory_better.mean())
+            if memory_gaps:
+                info["ref_memory_gap_mean"] = float(np.mean(memory_gaps))
 
     info["route_adv_mean"], info["route_adv_std"] = _finite_mean_std(route_adv)
     return (
@@ -648,6 +746,10 @@ def train_from_config(
         use_graph_token=bool(model_cfg.get("use_graph_token", True)),
         use_dynamic_embedding=bool(model_cfg.get("use_dynamic_embedding", False)),
         use_candidate_dynamic_embedding=model_cfg.get("use_candidate_dynamic_embedding", False),
+        use_dynamic_decision_encoder=bool(
+            model_cfg.get("use_dynamic_decision_encoder", False)
+        ),
+        dynamic_decision_heads=int(model_cfg.get("dynamic_decision_heads", 4)),
     ).to(device)
     optimizer = torch.optim.AdamW(
         agent.parameters(),
@@ -725,6 +827,11 @@ def train_from_config(
         "sl_coef",
         "sl_ref_gate_mean",
         "sl_ref_gate_std",
+        "sl_ref_memory_gate_mean",
+        "sl_ref_memory_gate_std",
+        "sl_ref_memory_better_rate",
+        "sl_ref_memory_gap_mean",
+        "sl_ref_base_gap_ratio_mean",
         "offline_updates",
         "group_adv_mean",
         "group_adv_std",
@@ -792,6 +899,7 @@ def train_from_config(
         expert_buffer = _load_expert_buffer(cfg, seed, debug_enabled, df)
         best_eval_objective = float("inf")
         best_eval_epoch = 0
+        policy_best_objectives: dict[str, float] = {}
         _debug_log(
             debug_enabled,
             df,
@@ -802,6 +910,7 @@ def train_from_config(
             f"n_encode_layers={model_cfg.get('n_encode_layers', 2)} "
             f"use_graph_token={model_cfg.get('use_graph_token', True)} "
             f"use_dynamic_embedding={model_cfg.get('use_dynamic_embedding', False)} "
+            f"use_dynamic_decision_encoder={model_cfg.get('use_dynamic_decision_encoder', False)} "
             f"mixed_precision={amp_enabled} "
             f"offline_method={offline_method} use_gae={use_gae} gae_lambda={gae_lambda} "
             f"expert_steps={expert_buffer.num_steps if expert_buffer is not None else 0} "
@@ -881,12 +990,14 @@ def train_from_config(
                 route_adv_tensor = None
                 route_success_tensor = None
                 if sl_enabled:
+                    _update_policy_best_objectives(policy_best_objectives, batch, envs)
                     route_adv_tensor, route_success_tensor, adv_info = _solution_level_advantage_tensors(
                         batch,
                         cfg,
                         envs,
                         expert_buffer,
                         device,
+                        policy_best_objectives=policy_best_objectives,
                     )
                 else:
                     advantages, adv_info = _apply_auxiliary_advantages(
@@ -1028,6 +1139,11 @@ def train_from_config(
                         "sl_coef": float(offline_cfg.get("sl_coef", offline_cfg.get("route_loss_coef", 0.10))),
                         "sl_ref_gate_mean": adv_info.get("ref_gate_mean", 0.0),
                         "sl_ref_gate_std": adv_info.get("ref_gate_std", 0.0),
+                        "sl_ref_memory_gate_mean": adv_info.get("ref_memory_gate_mean", 0.0),
+                        "sl_ref_memory_gate_std": adv_info.get("ref_memory_gate_std", 0.0),
+                        "sl_ref_memory_better_rate": adv_info.get("ref_memory_better_rate", 0.0),
+                        "sl_ref_memory_gap_mean": adv_info.get("ref_memory_gap_mean", 0.0),
+                        "sl_ref_base_gap_ratio_mean": adv_info.get("ref_base_gap_ratio_mean", 0.0),
                     }
                 if profile_timing:
                     _sync_cuda(device)
@@ -1074,6 +1190,8 @@ def train_from_config(
                     f"{_format_float(adv_info.get('group_adv_std', 0.0))} "
                     f"ref_adv={_format_float(adv_info.get('ref_adv_mean', 0.0))}/"
                     f"{_format_float(adv_info.get('ref_adv_std', 0.0))} "
+                    f"ref_gap={_format_float(adv_info.get('ref_base_gap_ratio_mean', 0.0))} "
+                    f"ref_mem_gate={_format_float(adv_info.get('ref_memory_gate_mean', 0.0))} "
                     f"bc={_format_float(bc_info.get('bc_loss', 0.0))} "
                     f"bc_acc={_format_float(bc_info.get('bc_accuracy', 0.0))} "
                     f"route_bc={_format_float(bc_info.get('route_bc_loss', 0.0))} "
@@ -1159,6 +1277,11 @@ def train_from_config(
                     "sl_coef": sl_info.get("sl_coef", ""),
                     "sl_ref_gate_mean": sl_info.get("sl_ref_gate_mean", ""),
                     "sl_ref_gate_std": sl_info.get("sl_ref_gate_std", ""),
+                    "sl_ref_memory_gate_mean": sl_info.get("sl_ref_memory_gate_mean", ""),
+                    "sl_ref_memory_gate_std": sl_info.get("sl_ref_memory_gate_std", ""),
+                    "sl_ref_memory_better_rate": sl_info.get("sl_ref_memory_better_rate", ""),
+                    "sl_ref_memory_gap_mean": sl_info.get("sl_ref_memory_gap_mean", ""),
+                    "sl_ref_base_gap_ratio_mean": sl_info.get("sl_ref_base_gap_ratio_mean", ""),
                     "offline_updates": offline_updates,
                     "group_adv_mean": adv_info.get("group_adv_mean", ""),
                     "group_adv_std": adv_info.get("group_adv_std", ""),

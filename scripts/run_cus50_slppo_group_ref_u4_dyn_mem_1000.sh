@@ -16,7 +16,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 cmd=(
   "$PYTHON_BIN" -m offline2online.train
-  --config "$O2O_ROOT/ablation/configs/cus50_o2o_dapg_u4_1000.yaml"
+  --config "$O2O_ROOT/configs/cus50_o2o_sl_ppo_group_ref_u4_dyn_mem_1000.yaml"
   --seed "$SEED"
   --device cuda
 )
@@ -26,4 +26,4 @@ fi
 
 cd "$O2O_ROOT"
 CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "${cmd[@]}" \
-  > "$O2O_ROOT/results/launch_logs/cus50_dapg_u4_1000_seed_${SEED}.log" 2>&1
+  > "$O2O_ROOT/results/launch_logs/cus50_slppo_group_ref_u4_dyn_mem_1000_seed_${SEED}.log" 2>&1

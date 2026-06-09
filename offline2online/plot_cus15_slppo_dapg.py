@@ -23,6 +23,12 @@ RUNS = [
         "linestyle": "--",
     },
     {
+        "label": "SL-PPO u4 group+ref-gap + dyn + mem-gate + DDE",
+        "run_name": "O2O_CUS15_SL_PPO_GROUP_REFGAP_MEM_DYN_DDE_R40_U4_E1000",
+        "color": "#e45756",
+        "linestyle": "-",
+    },
+    {
         "label": "DAPG u4",
         "run_name": "O2O_CUS15_DAPG_R40_U4_E1000",
         "color": "#f58518",

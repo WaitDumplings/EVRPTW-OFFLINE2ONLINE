@@ -12,6 +12,7 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-cus15-offline-methods}"
 
 cd "$O2O_ROOT"
 while tmux has-session -t cus15_slppo_group_ref_u4_1000 2>/dev/null \
+  || tmux has-session -t cus15_slppo_group_refgap_u4_dyn_mem_dde_1000 2>/dev/null \
   || tmux has-session -t cus15_dapg_u4_1000 2>/dev/null \
   || tmux has-session -t cus15_dapg_u4_dyn_1000 2>/dev/null; do
   "$PYTHON_BIN" -m offline2online.plot_cus15_slppo_dapg || true

@@ -140,6 +140,8 @@ class Backbone(nn.Module):
         use_graph_token: bool = True,
         use_dynamic_embedding: bool = False,
         use_candidate_dynamic_embedding: bool | None = None,
+        use_dynamic_decision_encoder: bool = False,
+        dynamic_decision_heads: int = 4,
     ):
         super().__init__()
         del use_graph_token  # graph token is intrinsic to the migrated graph encoder.
@@ -162,6 +164,8 @@ class Backbone(nn.Module):
             problem=self.problem,
             tanh_clipping=tanh_clipping,
             use_candidate_dynamic_embedding=self.use_candidate_dynamic_embedding,
+            use_dynamic_decision_encoder=use_dynamic_decision_encoder,
+            dynamic_decision_heads=dynamic_decision_heads,
         )
 
         self.dist_bias_scale = nn.Parameter(torch.tensor(1.0))
@@ -285,6 +289,8 @@ class Agent(nn.Module):
         use_graph_token: bool = True,
         use_dynamic_embedding: bool = False,
         use_candidate_dynamic_embedding: bool | None = None,
+        use_dynamic_decision_encoder: bool = False,
+        dynamic_decision_heads: int = 4,
     ):
         super().__init__()
         self.backbone = Backbone(
@@ -296,6 +302,8 @@ class Agent(nn.Module):
             use_graph_token=use_graph_token,
             use_dynamic_embedding=use_dynamic_embedding,
             use_candidate_dynamic_embedding=use_candidate_dynamic_embedding,
+            use_dynamic_decision_encoder=use_dynamic_decision_encoder,
+            dynamic_decision_heads=dynamic_decision_heads,
         )
         self.actor = Actor()
         self.critic = Critic(hidden_size=embedding_dim)
@@ -337,4 +345,3 @@ class Agent(nn.Module):
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(backbone_output), cached_embeddings
-

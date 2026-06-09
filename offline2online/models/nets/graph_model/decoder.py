@@ -377,6 +377,511 @@ class StructuredGraphStateFusion(nn.Module):
         return query_delta, key_delta, value_delta, logit_delta
 
 
+class DynamicDecisionEncoder(nn.Module):
+    """
+    Lightweight online-state encoder for the decoder.
+
+    The static encoder still owns the graph representation. This module builds a
+    small set of per-step dynamic tokens from the feasible frontier, route memory,
+    current node and scalar vehicle state, then produces a query correction and a
+    candidate energy bias. The candidate path is scalar, so it adds online
+    expressiveness without another [B,T,N,3D] tensor.
+    """
+
+    def __init__(self, embedding_dim, n_heads=4, enabled=False):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.enabled = bool(enabled)
+        self.system_feature_dim = 12
+        self.candidate_feature_dim = 24
+        self.num_tokens = 9
+
+        n_heads = max(1, int(n_heads))
+        if self.embedding_dim % n_heads != 0:
+            n_heads = 1
+
+        self.state_proj = nn.Sequential(
+            nn.LayerNorm(self.system_feature_dim),
+            nn.Linear(self.system_feature_dim, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+        self.token_type = nn.Parameter(torch.zeros(1, self.num_tokens, embedding_dim))
+        self.token_attn = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=n_heads,
+            batch_first=True,
+        )
+        self.token_norm = nn.LayerNorm(embedding_dim)
+        self.token_ff = nn.Sequential(
+            nn.LayerNorm(embedding_dim),
+            nn.Linear(embedding_dim, 2 * embedding_dim),
+            nn.SiLU(),
+            nn.Linear(2 * embedding_dim, embedding_dim),
+        )
+        self.token_ff_norm = nn.LayerNorm(embedding_dim)
+        self.query_out = nn.Sequential(
+            nn.LayerNorm(3 * embedding_dim),
+            nn.Linear(3 * embedding_dim, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+        self.energy_context_proj = nn.Sequential(
+            nn.LayerNorm(embedding_dim),
+            nn.Linear(embedding_dim, embedding_dim, bias=False),
+        )
+        self.node_energy_proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        self.candidate_bias = nn.Sequential(
+            nn.LayerNorm(self.candidate_feature_dim),
+            nn.Linear(self.candidate_feature_dim, embedding_dim // 2),
+            nn.SiLU(),
+            nn.Linear(embedding_dim // 2, 1),
+        )
+        self.query_scale = nn.Parameter(torch.tensor(0.1))
+        self.energy_scale = nn.Parameter(torch.tensor(0.0))
+        self.feature_bias_scale = nn.Parameter(torch.tensor(0.1))
+
+        nn.init.normal_(self.token_type, mean=0.0, std=0.02)
+        nn.init.xavier_uniform_(self.state_proj[1].weight, gain=0.5)
+        nn.init.zeros_(self.state_proj[1].bias)
+        nn.init.xavier_uniform_(self.state_proj[3].weight, gain=0.5)
+        nn.init.zeros_(self.state_proj[3].bias)
+        nn.init.xavier_uniform_(self.query_out[1].weight, gain=0.5)
+        nn.init.zeros_(self.query_out[1].bias)
+        nn.init.zeros_(self.query_out[3].weight)
+        nn.init.zeros_(self.query_out[3].bias)
+        nn.init.zeros_(self.candidate_bias[-1].weight)
+        nn.init.zeros_(self.candidate_bias[-1].bias)
+
+    @staticmethod
+    def _step_count(state, fallback=1):
+        action_mask = state.states.get("action_mask", None)
+        if torch.is_tensor(action_mask) and action_mask.dim() >= 3:
+            return int(action_mask.size(1))
+        current = state.get_current_node()
+        if current.dim() >= 2:
+            return int(current.size(1))
+        return int(fallback)
+
+    @staticmethod
+    def _expand_step(x, T):
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        if x.size(1) == 1 and T != 1:
+            x = x.expand(-1, T, -1)
+        return x
+
+    @staticmethod
+    def _expand_mask(mask, T):
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(1)
+        if mask.size(1) == 1 and T != 1:
+            mask = mask.expand(-1, T, -1)
+        return mask
+
+    @staticmethod
+    def _as_step_scalar(x, T, like):
+        B = like.size(0)
+        if x is None:
+            return like.new_zeros(B, T, 1)
+        x = x.to(device=like.device, dtype=like.dtype)
+        if x.dim() == 0:
+            x = x.view(1, 1, 1)
+        elif x.dim() == 1:
+            x = x[:, None, None]
+        elif x.dim() == 2:
+            x = x.unsqueeze(-1)
+        elif x.dim() == 3 and x.size(-1) != 1:
+            x = x[..., :1]
+        if x.size(0) == 1 and B != 1:
+            x = x.expand(B, -1, -1)
+        if x.size(1) == 1 and T != 1:
+            x = x.expand(-1, T, -1)
+        return x
+
+    @staticmethod
+    def _as_step_index(node_idx, T, node_embeddings):
+        if node_idx.dim() == 1:
+            node_idx = node_idx.unsqueeze(1)
+        node_idx = node_idx.to(device=node_embeddings.device, dtype=torch.long)
+        if node_idx.size(1) == 1 and T != 1:
+            node_idx = node_idx.expand(-1, T)
+        return node_idx.clamp(min=0, max=node_embeddings.size(1) - 1)
+
+    @staticmethod
+    def _masked_mean(node_embeddings, mask, weights=None):
+        mask = mask.to(device=node_embeddings.device, dtype=node_embeddings.dtype)
+        if weights is not None:
+            weights = weights.to(device=node_embeddings.device, dtype=node_embeddings.dtype)
+            mask = mask * weights.clamp_min(0.0)
+        denom = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return torch.matmul(mask, node_embeddings) / denom
+
+    @staticmethod
+    def _gather_node(node_embeddings, node_idx):
+        if node_idx.dim() == 1:
+            node_idx = node_idx.unsqueeze(1)
+        node_idx = node_idx.to(device=node_embeddings.device, dtype=torch.long)
+        node_idx = node_idx.clamp(min=0, max=node_embeddings.size(1) - 1)
+        gather_idx = node_idx.unsqueeze(-1).expand(-1, -1, node_embeddings.size(-1))
+        return torch.gather(node_embeddings, dim=1, index=gather_idx)
+
+    def _node_type_masks(self, state, node_embeddings, T):
+        B, N, _ = node_embeddings.shape
+        n_cus = int(state.states["cus_loc"].size(1))
+        n_rs = int(state.states["rs_loc"].size(1))
+        customer = torch.zeros(B, 1, N, dtype=torch.bool, device=node_embeddings.device)
+        rs = torch.zeros_like(customer)
+        customer[:, :, 1 : 1 + n_cus] = True
+        if n_rs > 0:
+            rs[:, :, 1 + n_cus : 1 + n_cus + n_rs] = True
+        depot = torch.zeros_like(customer)
+        depot[:, :, 0] = True
+        if T != 1:
+            customer = customer.expand(-1, T, -1)
+            rs = rs.expand(-1, T, -1)
+            depot = depot.expand(-1, T, -1)
+        return depot, customer, rs
+
+    def _system_features(
+        self,
+        state,
+        node_embeddings,
+        T,
+        action_mask,
+        depot_mask,
+        customer_mask,
+        rs_mask,
+        route_mask,
+        current_node_idx,
+    ):
+        feasible_customer_ratio = (
+            (action_mask & customer_mask).to(node_embeddings.dtype).sum(-1, keepdim=True)
+            / customer_mask.to(node_embeddings.dtype).sum(-1, keepdim=True).clamp_min(1.0)
+        )
+        feasible_rs_ratio = (
+            (action_mask & rs_mask).to(node_embeddings.dtype).sum(-1, keepdim=True)
+            / rs_mask.to(node_embeddings.dtype).sum(-1, keepdim=True).clamp_min(1.0)
+        )
+        depot_feasible = (action_mask & depot_mask).to(node_embeddings.dtype).sum(
+            -1, keepdim=True
+        ).clamp(max=1.0)
+        current_is_rs = torch.gather(
+            rs_mask.to(node_embeddings.dtype),
+            dim=2,
+            index=current_node_idx.unsqueeze(-1),
+        )
+        route_len_ratio = (
+            route_mask.to(node_embeddings.dtype).sum(dim=-1, keepdim=True)
+            / float(max(node_embeddings.size(1), 1))
+        )
+
+        return torch.cat(
+            [
+                self._as_step_scalar(state.states.get("current_load"), T, node_embeddings),
+                self._as_step_scalar(state.states.get("current_battery"), T, node_embeddings),
+                self._as_step_scalar(state.states.get("current_time"), T, node_embeddings),
+                self._as_step_scalar(
+                    state.states.get("visited_customers_ratio"), T, node_embeddings
+                ),
+                self._as_step_scalar(
+                    state.states.get("remain_feasible_customers_ratio"),
+                    T,
+                    node_embeddings,
+                ),
+                self._as_step_scalar(
+                    state.states.get("route_served_customers_ratio"), T, node_embeddings
+                ),
+                self._as_step_scalar(state.states.get("rs_streak_ratio"), T, node_embeddings),
+                depot_feasible,
+                feasible_customer_ratio,
+                feasible_rs_ratio,
+                current_is_rs,
+                route_len_ratio,
+            ],
+            dim=-1,
+        )
+
+    def _candidate_features(
+        self,
+        state,
+        node_embeddings,
+        T,
+        action_mask,
+        depot_mask,
+        customer_mask,
+        rs_mask,
+        route_mask,
+        visit_count,
+        route_order,
+        current_node_idx,
+        prev_node_idx,
+    ):
+        depot_loc = state.states["depot_loc"]
+        if depot_loc.dim() == 2:
+            depot_loc = depot_loc.unsqueeze(1)
+
+        cus_loc = state.states["cus_loc"]
+        rs_loc = state.states["rs_loc"]
+        node_loc = torch.cat([depot_loc, cus_loc, rs_loc], dim=1)
+        B, N, _ = node_loc.shape
+        device = node_embeddings.device
+        dtype = node_embeddings.dtype
+
+        current_loc = torch.gather(
+            node_loc.to(device=device, dtype=dtype),
+            dim=1,
+            index=current_node_idx.unsqueeze(-1).expand(-1, -1, node_loc.size(-1)),
+        )
+        rel = node_loc.to(device=device, dtype=dtype).unsqueeze(1) - current_loc.unsqueeze(2)
+        travel_proxy = torch.linalg.norm(rel, dim=-1).clamp(min=0.0) / (2.0 ** 0.5)
+
+        edge_energy = state.states.get("edge_energy", None)
+        if edge_energy is None:
+            energy_cost = travel_proxy
+        else:
+            edge_energy = edge_energy.to(device=device, dtype=dtype)
+            if edge_energy.dim() == 2:
+                edge_energy = edge_energy.unsqueeze(0)
+            if edge_energy.size(0) == 1 and B != 1:
+                edge_energy = edge_energy.expand(B, -1, -1)
+            edge_energy = edge_energy.unsqueeze(1).expand(-1, T, -1, -1)
+            gather_idx = current_node_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, N)
+            energy_cost = torch.gather(edge_energy, dim=2, index=gather_idx).squeeze(2)
+
+        time_window = state.states["time_window"].to(device=device, dtype=dtype)
+        service_time = state.states["service_time"].to(device=device, dtype=dtype)
+        if service_time.dim() == 3:
+            service_time = service_time.squeeze(-1)
+        demand = state.states["demand"].to(device=device, dtype=dtype)
+        if demand.dim() == 3:
+            demand = demand.squeeze(-1)
+
+        tw_open = time_window[..., 0].unsqueeze(1)
+        tw_close = time_window[..., 1].unsqueeze(1)
+        service = service_time.unsqueeze(1).expand(B, T, N)
+        demand_step = demand.unsqueeze(1).expand(B, T, N)
+
+        current_time = self._as_step_scalar(state.current_time.float(), T, node_embeddings)
+        current_load = self._as_step_scalar(state.used_capacity.float(), T, node_embeddings)
+        current_battery = self._as_step_scalar(state.used_battery.float(), T, node_embeddings)
+
+        arrival = current_time + travel_proxy
+        wait = torch.relu(tw_open - arrival)
+        service_start = torch.maximum(arrival, tw_open)
+        finish = service_start + service
+        arrival_slack = tw_close - arrival
+        finish_slack = tw_close - finish
+        load_after = current_load + demand_step
+        battery_after = current_battery + energy_cost
+
+        battery_capacity = state.states.get("battery_capacity", None)
+        if battery_capacity is None:
+            battery_capacity = torch.ones(B, 1, 1, device=device, dtype=dtype)
+        else:
+            battery_capacity = battery_capacity.to(device=device, dtype=dtype)
+            if battery_capacity.dim() == 0:
+                battery_capacity = battery_capacity.view(1, 1, 1)
+            elif battery_capacity.dim() == 1:
+                battery_capacity = battery_capacity.view(-1, 1, 1)
+            else:
+                battery_capacity = battery_capacity.reshape(battery_capacity.size(0), -1)
+                battery_capacity = battery_capacity[:, :1].view(-1, 1, 1)
+            if battery_capacity.size(0) == 1 and B != 1:
+                battery_capacity = battery_capacity.expand(B, -1, -1)
+        battery_capacity = battery_capacity.clamp_min(1e-6)
+        energy_ratio = (energy_cost / battery_capacity).clamp(0.0, 2.0)
+        current_battery_feasible = (battery_after <= battery_capacity).to(dtype)
+
+        node_ids = torch.arange(N, device=device).view(1, 1, N)
+        current_candidate = node_ids == current_node_idx.unsqueeze(-1)
+        prev_candidate = node_ids == prev_node_idx.unsqueeze(-1)
+        visit_norm = visit_count.clamp(0.0, 5.0) / 5.0
+        route_order_clamped = route_order.clamp(0.0, 1.0)
+        unvisited_customer = customer_mask & (visit_count <= 0)
+        route_served_ratio = self._as_step_scalar(
+            state.states.get("route_served_customers_ratio"),
+            T,
+            node_embeddings,
+        ).clamp(0.0, 1.0)
+        no_customer_route = (route_served_ratio <= 1e-6).to(dtype)
+        rs_streak_ratio = self._as_step_scalar(
+            state.states.get("rs_streak_ratio"),
+            T,
+            node_embeddings,
+        ).clamp(0.0, 1.0)
+        repeated_rs_candidate = (visit_norm > 0).to(dtype) * rs_mask.to(dtype)
+
+        return torch.stack(
+            [
+                action_mask.to(dtype),
+                (~action_mask).to(dtype),
+                depot_mask.to(dtype),
+                customer_mask.to(dtype),
+                rs_mask.to(dtype),
+                unvisited_customer.to(dtype),
+                route_mask.to(dtype),
+                visit_norm,
+                route_order_clamped,
+                current_candidate.to(dtype),
+                prev_candidate.to(dtype),
+                travel_proxy.clamp(0.0, 2.0),
+                energy_ratio,
+                arrival.clamp(0.0, 2.0),
+                wait.clamp(0.0, 1.0),
+                arrival_slack.clamp(-1.0, 1.0),
+                finish_slack.clamp(-1.0, 1.0),
+                demand_step,
+                load_after.clamp(0.0, 2.0),
+                battery_after.clamp(0.0, 2.0),
+                current_battery_feasible,
+                route_served_ratio.expand(B, T, N),
+                no_customer_route.expand(B, T, N),
+                rs_streak_ratio.expand(B, T, N) * repeated_rs_candidate,
+            ],
+            dim=-1,
+        )
+
+    def forward(
+        self,
+        node_embeddings,
+        graph_context,
+        step_context,
+        dynamic_context,
+        state,
+    ):
+        if not self.enabled:
+            return 0, 0
+
+        T = self._step_count(state, fallback=step_context.size(1))
+        graph_context = self._expand_step(graph_context, T)
+        step_context = self._expand_step(step_context, T)
+        dynamic_context = self._expand_step(dynamic_context, T)
+        base_query = graph_context + step_context + dynamic_context
+
+        depot_mask, customer_mask, rs_mask = self._node_type_masks(
+            state, node_embeddings, T
+        )
+        action_mask = self._expand_mask(state.states["action_mask"].to(torch.bool), T)
+
+        node_visit_count = state.states.get("node_visit_count", None)
+        if node_visit_count is None:
+            visit_count = action_mask.new_zeros(action_mask.shape, dtype=node_embeddings.dtype)
+        else:
+            visit_count = node_visit_count.to(
+                device=node_embeddings.device,
+                dtype=node_embeddings.dtype,
+            )
+            visit_count = self._expand_mask(visit_count, T)
+
+        route_order = state.states.get("route_order_rank", None)
+        if route_order is None:
+            route_order = (visit_count > 0).to(dtype=node_embeddings.dtype)
+        else:
+            route_order = route_order.to(
+                device=node_embeddings.device,
+                dtype=node_embeddings.dtype,
+            )
+            route_order = self._expand_mask(route_order, T)
+        route_mask = route_order > 0
+
+        current_node_idx = self._as_step_index(
+            state.get_current_node(), T, node_embeddings
+        )
+        prev_node_idx = self._as_step_index(
+            state.states.get("prev_node_idx", state.get_current_node()),
+            T,
+            node_embeddings,
+        )
+        current_node = self._gather_node(node_embeddings, current_node_idx)
+
+        route_summary = self._masked_mean(
+            node_embeddings,
+            route_mask,
+            weights=1.0 + route_order,
+        )
+        feasible_customer = action_mask & customer_mask
+        feasible_rs = action_mask & rs_mask
+        unvisited_customer = customer_mask & (visit_count <= 0)
+        feasible_customer_summary = self._masked_mean(node_embeddings, feasible_customer)
+        feasible_rs_summary = self._masked_mean(node_embeddings, feasible_rs)
+        unvisited_customer_summary = self._masked_mean(node_embeddings, unvisited_customer)
+        depot_summary = self._masked_mean(node_embeddings, depot_mask)
+
+        system_features = self._system_features(
+            state=state,
+            node_embeddings=node_embeddings,
+            T=T,
+            action_mask=action_mask,
+            depot_mask=depot_mask,
+            customer_mask=customer_mask,
+            rs_mask=rs_mask,
+            route_mask=route_mask,
+            current_node_idx=current_node_idx,
+        )
+        state_token = self.state_proj(system_features)
+
+        tokens = torch.stack(
+            [
+                base_query,
+                state_token,
+                current_node,
+                route_summary,
+                feasible_customer_summary,
+                feasible_rs_summary,
+                unvisited_customer_summary,
+                depot_summary,
+                graph_context,
+            ],
+            dim=2,
+        )
+        B, _, S, D = tokens.shape
+        flat_tokens = tokens.reshape(B * T, S, D)
+        flat_tokens = flat_tokens + self.token_type[:, :S, :].to(
+            device=flat_tokens.device,
+            dtype=flat_tokens.dtype,
+        )
+        attended_tokens, _ = self.token_attn(
+            flat_tokens,
+            flat_tokens,
+            flat_tokens,
+            need_weights=False,
+        )
+        flat_tokens = self.token_norm(flat_tokens + attended_tokens)
+        flat_tokens = self.token_ff_norm(flat_tokens + self.token_ff(flat_tokens))
+        decision_token = flat_tokens[:, 0, :].reshape(B, T, D)
+
+        query_delta = torch.tanh(self.query_scale) * self.query_out(
+            torch.cat([base_query, decision_token, state_token], dim=-1)
+        )
+
+        energy_context = self.energy_context_proj(decision_token)
+        node_energy = self.node_energy_proj(node_embeddings)
+        bilinear_bias = torch.einsum("btd,bnd->btn", energy_context, node_energy)
+        bilinear_bias = bilinear_bias / (float(D) ** 0.5)
+
+        candidate_features = self._candidate_features(
+            state=state,
+            node_embeddings=node_embeddings,
+            T=T,
+            action_mask=action_mask,
+            depot_mask=depot_mask,
+            customer_mask=customer_mask,
+            rs_mask=rs_mask,
+            route_mask=route_mask,
+            visit_count=visit_count,
+            route_order=route_order,
+            current_node_idx=current_node_idx,
+            prev_node_idx=prev_node_idx,
+        )
+        feature_bias = self.candidate_bias(candidate_features).squeeze(-1)
+        logit_bias = (
+            torch.tanh(self.energy_scale) * bilinear_bias
+            + torch.tanh(self.feature_bias_scale) * feature_bias
+        )
+        return query_delta, logit_bias
+
+
 class Decoder(nn.Module):
     """
     Pointer-style decoder.
@@ -401,6 +906,8 @@ class Decoder(nn.Module):
         problem,
         tanh_clipping,
         use_candidate_dynamic_embedding=True,
+        use_dynamic_decision_encoder=False,
+        dynamic_decision_heads=4,
     ):
         super().__init__()
 
@@ -442,6 +949,11 @@ class Decoder(nn.Module):
             {"embedding_dim": embedding_dim},
         )
         self.structured_state_fusion = StructuredGraphStateFusion(embedding_dim)
+        self.dynamic_decision_encoder = DynamicDecisionEncoder(
+            embedding_dim=embedding_dim,
+            n_heads=dynamic_decision_heads,
+            enabled=use_dynamic_decision_encoder,
+        )
 
         # glimpse + pointer
         self.glimpse = MultiHeadAttention(
@@ -528,7 +1040,20 @@ class Decoder(nn.Module):
             dynamic_context=dynamic_context,
             state=state,
         )
-        query = graph_context + step_context + dynamic_context + structured_query_delta
+        decision_query_delta, decision_logit_bias = self.dynamic_decision_encoder(
+            node_embeddings=node_embeddings,
+            graph_context=graph_context,
+            step_context=step_context,
+            dynamic_context=dynamic_context,
+            state=state,
+        )
+        query = (
+            graph_context
+            + step_context
+            + dynamic_context
+            + structured_query_delta
+            + decision_query_delta
+        )
 
         # dynamic node-wise modifiers
         glimpse_key_dynamic, glimpse_val_dynamic, logit_key_dynamic = self.dynamic_embedding(state)
@@ -575,6 +1100,8 @@ class Decoder(nn.Module):
             logit_K=logit_K,
             mask=mask,
         )
+        if torch.is_tensor(decision_logit_bias):
+            logits = logits + decision_logit_bias.to(device=logits.device, dtype=logits.dtype)
         return logits, glimpse
 
     def calc_logits(self, query, glimpse_K, glimpse_V, logit_K, mask):

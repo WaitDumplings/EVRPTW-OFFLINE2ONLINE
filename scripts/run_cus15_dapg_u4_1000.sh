@@ -14,10 +14,16 @@ export PYTHONUNBUFFERED=1
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-cus15-offline-methods}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+cmd=(
+  "$PYTHON_BIN" -m offline2online.train
+  --config "$O2O_ROOT/ablation/configs/cus15_o2o_dapg_u4_1000.yaml"
+  --seed "$SEED"
+  --device cuda
+)
+if (($#)); then
+  cmd+=("$@")
+fi
+
 cd "$O2O_ROOT"
-CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "$PYTHON_BIN" -m offline2online.train \
-  --config "$O2O_ROOT/ablation/configs/cus15_o2o_dapg_u4_1000.yaml" \
-  --seed "$SEED" \
-  --device cuda \
-  "$@" \
+CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "${cmd[@]}" \
   > "$O2O_ROOT/results/launch_logs/cus15_dapg_u4_1000_seed_${SEED}.log" 2>&1
