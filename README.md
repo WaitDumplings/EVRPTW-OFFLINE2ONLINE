@@ -100,14 +100,17 @@ python -m offline2online.train --config cus5_o2o_ppo.yaml --seed 2005 --use-refe
 
 ## FRRO Semantics
 
-`offline.method: frro` is a solution-level PPO method that treats each solver route as a falsifiable reference, not as an action expert. It uses the same route-level clipped PPO ratio as SL-PPO, but the reference component becomes one-sided after falsification:
+`offline.method: frro` is a solution-level PPO method that treats each solver route as a falsifiable reference candidate, not as an action expert. Policy-sampled routes use a route-level clipped PPO ratio with a remaining-gap improvement advantage:
 
 ```text
-delta_ref = (J_ref - J_policy_route) / (rho * J_ref)
-A_FRRO = max(delta_ref, 0) + gate_falsify * min(delta_ref, 0)
+J_base = mean successful objective of current policy rollouts
+S = max(std_policy, kappa * [J_base - J_ref]_+, gap_floor_ratio * J_ref)
+A_imp(tau) = clip((J_base - J(tau)) / S, -frro_clip, frro_clip)
 ```
 
-`gate_falsify` decays to zero once the current sampled routes or the historical policy memory beat the reference by `frro_falsification_margin`. After that point, the reference can still reward routes that improve beyond it, but it no longer penalizes the policy for not matching a potentially suboptimal solver solution. Group route advantage remains available to rank the current on-policy rollouts.
+The solver route is added as a bounded auxiliary reference candidate with the same clipped route-ratio form, but it is not described as an on-policy PPO sample. Its advantage is multiplied by a quality gate and a current/history falsification gate, then by `frro_expert_candidate_weight`. Once current sampled routes or historical policy memory beat the reference by `frro_falsification_margin`, the solver candidate is disabled for that instance.
+
+In the checked-in FRRO configs, `offline.sl_coef` is the route objective weight `alpha_R` and `advantage.frro_coef` is kept at `1.0` so the improvement advantage is not double-scaled. Use `FRRO_ALPHA` to change `alpha_R` and `FRRO_EXPERT_WEIGHT` to sweep the expert candidate weight.
 
 ## Ablation Baselines
 
@@ -167,6 +170,12 @@ bash scripts/run_cus15_dapg_u4_dyn_1000.sh
 bash scripts/watch_cus15_slppo_dapg_plot.sh
 ```
 
+For the FRRO run, the launch script defaults to `FRRO_ALPHA=0.10` and `FRRO_EXPERT_WEIGHT=2.0`, producing run name `O2O_CUS15_FRRO_A010_LE2_DYN_MEM_DDE_KV_R40_U4_E1000`. Override these environment variables to run lambda-E sweeps, for example:
+
+```bash
+CUDA_DEVICE=1 FRRO_EXPERT_WEIGHT=4.0 FRRO_TAG=A010_LE4 bash scripts/run_cus15_frro_u4_dyn_mem_dde_1000.sh
+```
+
 The Cus15 plot helper writes:
 
 ```text
@@ -195,7 +204,7 @@ bash scripts/run_cus50_dapg_u4_dyn_1000.sh
 bash scripts/watch_cus50_slppo_dapg_plot.sh
 ```
 
-The plot helper overlays SL-PPO, DAPG, and the validation-set Gurobi best average from `/data/Maojie/gurobi_mul/results/val/Cus50/gurobi_summary.csv`. Override that path with `CUS50_GUROBI_VAL_SUMMARY`.
+The current Cus50 plot helper overlays DAPG, FRRO lambda-E sweeps, and the validation-set Gurobi best average from `/data/Maojie/gurobi_mul/results/val/Cus50/gurobi_summary.csv`. Override that path with `CUS50_GUROBI_VAL_SUMMARY`.
 
 ## Outputs
 

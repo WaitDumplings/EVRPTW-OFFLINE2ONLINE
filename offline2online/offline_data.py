@@ -234,6 +234,10 @@ class ExpertReplayBuffer:
             traj.instance_id: float(traj.objective_distance_km)
             for traj in self.trajectories
         }
+        self.trajectory_by_instance_id = {
+            traj.instance_id: traj
+            for traj in self.trajectories
+        }
         self.rng = np.random.default_rng(int(seed))
         self._step_index: list[tuple[int, int]] = [
             (traj_idx, step_idx)
@@ -256,6 +260,11 @@ class ExpertReplayBuffer:
             return None
         value = self.objective_by_instance_id.get(str(instance_id))
         return None if value is None else float(value)
+
+    def trajectory_for_instance(self, instance_id: str | None) -> ExpertTrajectory | None:
+        if instance_id is None:
+            return None
+        return self.trajectory_by_instance_id.get(str(instance_id))
 
     def sample_step_batch(self, batch_size: int) -> tuple[dict[str, np.ndarray], torch.Tensor]:
         indices = self.rng.integers(0, len(self._step_index), size=max(1, int(batch_size)))

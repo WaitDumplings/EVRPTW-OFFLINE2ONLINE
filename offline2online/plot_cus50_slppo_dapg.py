@@ -16,36 +16,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SEED = int(os.environ.get("SEED", "2005"))
 RUNS = [
     {
-        "label": "SL-PPO u4 group+ref",
-        "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_R70_U4_E1000",
-        "color": "#4c78a8",
-        "linestyle": "--",
-    },
-    {
-        "label": "SL-PPO u4 group+ref + dyn",
-        "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_DYN_R70_U4_E1000",
-        "color": "#72b7b2",
-        "linestyle": "-.",
-    },
-    {
-        "label": "SL-PPO u4 group+ref + dyn + mem-gate",
-        "run_name": "O2O_CUS50_SL_PPO_GROUP_REF_MEM_DYN_R70_U4_E1000",
-        "color": "#59a14f",
-        "linestyle": ":",
-    },
-    {
-        "label": "SL-PPO u4 group+ref-gap + dyn + mem-gate + DDE-KV",
-        "run_name": "O2O_CUS50_SL_PPO_GROUP_REFGAP_MEM_DYN_DDE_KV_R70_U4_E1000",
-        "color": "#e45756",
-        "linestyle": "-",
-    },
-    {
-        "label": "FRRO u4 + dyn + mem + DDE-KV",
-        "run_name": "O2O_CUS50_FRRO_DYN_MEM_DDE_KV_R70_U4_E1000",
-        "color": "#111111",
-        "linestyle": "-",
-    },
-    {
         "label": "DAPG u4",
         "run_name": "O2O_CUS50_DAPG_R70_U4_E1000",
         "color": "#f58518",
@@ -57,10 +27,33 @@ RUNS = [
         "color": "#9467bd",
         "linestyle": "-.",
     },
+    {
+        "label": "FRRO u4 + dyn + mem + DDE-KV, alpha=0.10, lambda_E=2",
+        "run_name": "O2O_CUS50_FRRO_A010_LE2_DYN_MEM_DDE_KV_R70_U4_E1000",
+        "color": "#111111",
+        "linestyle": "-",
+    },
+    {
+        "label": "FRRO u4 + dyn + mem + DDE-KV, alpha=0.10, lambda_E=4",
+        "run_name": "O2O_CUS50_FRRO_A010_LE4_DYN_MEM_DDE_KV_R70_U4_E1000",
+        "color": "#e45756",
+        "linestyle": "-",
+    },
 ]
 GUROBI_VAL_SUMMARY = Path(os.environ.get("CUS50_GUROBI_VAL_SUMMARY", "/data/Maojie/gurobi_mul/results/val/Cus50/gurobi_summary.csv"))
 OUTPUT_STEM = "cus50_offline_update_ablation_r70_e1000"
 LEGACY_OUTPUT_STEM = "cus50_slppo_group_ref_vs_dapg_r70_u2_e1000"
+
+
+def log_roots() -> list[Path]:
+    roots = [REPO_ROOT / "results" / "logs" / "Cus_50_CS_10"]
+    prev_root = REPO_ROOT.parent / "EVRPTW-OFFLINE2ONLINE_Prev" / "results" / "logs" / "Cus_50_CS_10"
+    if prev_root.exists():
+        roots.append(prev_root)
+    extra = os.environ.get("CUS50_EXTRA_LOG_ROOTS")
+    if extra:
+        roots.extend(Path(item) for item in extra.split(os.pathsep) if item)
+    return roots
 
 
 def _float_or_nan(value: Any) -> float:
@@ -71,8 +64,15 @@ def _float_or_nan(value: Any) -> float:
 
 
 def read_eval_log(run_name: str) -> list[dict[str, float]]:
-    path = REPO_ROOT / "results" / "logs" / "Cus_50_CS_10" / run_name / f"seed_{SEED}" / "eval_log.csv"
-    if not path.exists():
+    path = next(
+        (
+            root / run_name / f"seed_{SEED}" / "eval_log.csv"
+            for root in log_roots()
+            if (root / run_name / f"seed_{SEED}" / "eval_log.csv").exists()
+        ),
+        None,
+    )
+    if path is None:
         return []
     rows: list[dict[str, float]] = []
     with path.open("r", newline="", encoding="utf-8") as f:
@@ -181,7 +181,7 @@ def main() -> None:
             label=f"Gurobi best avg ({gurobi_avg:.2f} km, n={gurobi_n})",
         )
 
-    ax.set_title("Cus50 Validation Objective: Offline-to-Online Dynamic/Update Ablation")
+    ax.set_title("Cus50 Validation Objective: DAPG vs FRRO Lambda Sweep")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Avg objective distance (km)")
     ax.set_xlim(0, 1000)

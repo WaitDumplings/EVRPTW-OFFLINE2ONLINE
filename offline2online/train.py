@@ -9,6 +9,7 @@ from .trainer import load_config, train_from_config
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train migrated Ablation/TERRAN-full model on EVRPTW-D AC_v1.")
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
@@ -56,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frro-clip", type=float, default=None)
     parser.add_argument("--frro-falsification-margin", type=float, default=None)
     parser.add_argument("--frro-falsification-eta", type=float, default=None)
+    parser.add_argument("--frro-expert-candidate-weight", type=float, default=None)
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--no-mixed-precision", action="store_true")
     parser.add_argument("--eval-interval", type=int, default=None)
@@ -79,6 +81,8 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     overrides: dict[str, Any] = {"data": {}, "training": {}, "evaluation": {}, "offline": {}, "advantage": {}}
+    if args.run_name is not None:
+        overrides["run_name"] = args.run_name
     if args.mother_board_pool_size is not None:
         overrides["data"]["mother_board_pool_size"] = args.mother_board_pool_size
     if args.territory_pool_path is not None:
@@ -183,6 +187,8 @@ def main() -> None:
         overrides["advantage"]["frro_falsification_margin"] = args.frro_falsification_margin
     if args.frro_falsification_eta is not None:
         overrides["advantage"]["frro_falsification_eta"] = args.frro_falsification_eta
+    if args.frro_expert_candidate_weight is not None:
+        overrides["advantage"]["frro_expert_candidate_weight"] = args.frro_expert_candidate_weight
     if args.eval_interval is not None:
         overrides["evaluation"]["eval_interval"] = args.eval_interval
     if args.eval_path is not None:

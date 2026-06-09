@@ -80,9 +80,17 @@ r_route = exp(mean_t(log pi_new(a_t|s_t) - log pi_old(a_t|s_t)))
 L_SL = -E[min(r_route * A_route, clip(r_route) * A_route)]
 ```
 
-Solver routes are not inserted into the PPO ratio. They only supply reference objective values, and only the ablation imitation baselines directly supervise solver actions.
+Solver routes are never treated as PPO rollouts. In SL-PPO/reference-advantage runs they only supply reference objective values, and only the ablation imitation baselines directly supervise solver actions.
 
-FRRO (`offline.method: frro`) uses the same on-policy route-level PPO ratio, but replaces the symmetric reference term with a falsifiable reference objective. A route that beats the reference receives positive evidence. A route worse than the reference receives negative reference pressure only while neither current on-policy samples nor historical policy memory have beaten the reference by `advantage.frro_falsification_margin`. This lets a weak or time-limited solver solution stop acting as a teacher once the policy has falsified it.
+FRRO (`offline.method: frro`) uses a unified route-level improvement objective. Policy-sampled routes are scored by remaining-gap improvement,
+
+```text
+A_imp(tau) = clip((J_base - J(tau)) / S, -frro_clip, frro_clip)
+```
+
+where `J_base` is the current policy's successful-route baseline and `S` is the maximum of policy objective spread, positive solver gap, and `frro_gap_floor_ratio * J_ref`. The solver route enters as a bounded auxiliary reference candidate, not as an on-policy PPO sample. Its candidate advantage is multiplied by a quality gate, current/history falsification gate, and `frro_expert_candidate_weight`. Once current samples or policy memory beat the solver by `advantage.frro_falsification_margin`, the solver candidate is disabled for that instance.
+
+In the checked-in FRRO configs, `offline.sl_coef` is the route-objective weight `alpha_R`; `advantage.frro_coef` is kept at `1.0` to avoid double scaling. Launch scripts expose this as `FRRO_ALPHA`. Expert candidate strength is exposed as `FRRO_EXPERT_WEIGHT`.
 
 DAPG uses two stages:
 
@@ -234,6 +242,7 @@ The checked-in Cus15 server bundle mirrors the current u4 comparison while keepi
 - Environments: `training.num_envs_per_gpu: 640`.
 - Minibatches: `training.num_minibatches: 16`.
 - Model: graph token and attention bias enabled; dynamic embedding enabled in the `*_dyn_*` DAPG and FRRO+DDE configs.
+- FRRO defaults: `FRRO_ALPHA=0.10`, `FRRO_EXPERT_WEIGHT=2.0`, remaining-gap advantage, DDE-KV enabled, support gate disabled.
 - Validation: full Cus15 validation split, `eval_n_traj: 50`, `eval_batch_size: 1000`.
 - Offline source: `EVRPTW_DB_ROOT/results/offline_experts/dataset_v1/train/Cus15_Gurobi_2h/gurobi_summary.csv`.
 
@@ -260,6 +269,13 @@ Any launch script accepts extra trainer overrides:
 
 ```bash
 bash scripts/run_cus15_dapg_u4_dyn_1000.sh --num-envs-per-gpu 320 --eval-limit 100
+```
+
+For a Cus15 FRRO lambda-E sweep, keep the seed fixed and override only the environment variables:
+
+```bash
+CUDA_DEVICE=0 FRRO_EXPERT_WEIGHT=2.0 FRRO_TAG=A010_LE2 bash scripts/run_cus15_frro_u4_dyn_mem_dde_1000.sh
+CUDA_DEVICE=1 FRRO_EXPERT_WEIGHT=4.0 FRRO_TAG=A010_LE4 bash scripts/run_cus15_frro_u4_dyn_mem_dde_1000.sh
 ```
 
 Refresh the unified Cus15 plot while experiments run:

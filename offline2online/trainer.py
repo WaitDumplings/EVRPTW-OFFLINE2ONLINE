@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import csv
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import random
@@ -16,7 +17,7 @@ from .integrations.evrptw_db import configure_evrptw_db
 
 EVRPTW_DB_ROOT = configure_evrptw_db()
 
-from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.rollout import collect_rollout, compute_returns
+from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.rollout import collect_rollout, compute_returns, stack_observations
 from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.trainer import (
     _debug_log,
     _format_float,
@@ -194,15 +195,27 @@ def _advantage_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "reference_memory_margin",
         "use_frro",
         "frro_coef",
+        "frro_advantage_mode",
+        "frro_gap_baseline",
+        "frro_gap_floor_ratio",
+        "frro_gap_scale_coef",
+        "frro_std_floor",
         "frro_rho",
         "frro_clip",
         "frro_success_only",
         "frro_positive_coef",
         "frro_negative_coef",
+        "frro_quality_gate_eta",
         "frro_falsification_margin",
         "frro_falsification_eta",
         "frro_use_memory_falsification",
         "frro_use_current_falsification",
+        "frro_use_expert_candidate",
+        "frro_expert_candidate_weight",
+        "frro_expert_logprob_chunk_size",
+        "frro_use_support_gate",
+        "frro_support_logprob_min",
+        "frro_support_gate_temperature",
         "renormalize_after_aux_advantage",
     ):
         if key in offline_cfg and key not in adv_cfg:
@@ -221,21 +234,34 @@ def _advantage_config(cfg: dict[str, Any]) -> dict[str, Any]:
         adv_cfg.setdefault("reference_policy_estimate", "best")
     if _is_frro_method(method):
         adv_cfg["use_reference_advantage"] = False
+        adv_cfg["reference_adv_coef"] = 0.0
         adv_cfg.setdefault("use_group_advantage", True)
         adv_cfg.setdefault("group_adv_coef", 0.30)
         adv_cfg.setdefault("group_adv_clip", 3.0)
         adv_cfg.setdefault("group_adv_std_floor", 5.0)
         adv_cfg.setdefault("use_frro", True)
         adv_cfg.setdefault("frro_coef", 0.10)
+        adv_cfg.setdefault("frro_advantage_mode", "remaining_gap")
+        adv_cfg.setdefault("frro_gap_baseline", "mean")
+        adv_cfg.setdefault("frro_gap_floor_ratio", 0.01)
+        adv_cfg.setdefault("frro_gap_scale_coef", 1.0)
+        adv_cfg.setdefault("frro_std_floor", 5.0)
         adv_cfg.setdefault("frro_rho", 0.10)
         adv_cfg.setdefault("frro_clip", 2.0)
         adv_cfg.setdefault("frro_success_only", True)
         adv_cfg.setdefault("frro_positive_coef", 1.0)
         adv_cfg.setdefault("frro_negative_coef", 1.0)
+        adv_cfg.setdefault("frro_quality_gate_eta", 0.05)
         adv_cfg.setdefault("frro_falsification_margin", 0.005)
         adv_cfg.setdefault("frro_falsification_eta", 0.05)
         adv_cfg.setdefault("frro_use_memory_falsification", True)
         adv_cfg.setdefault("frro_use_current_falsification", True)
+        adv_cfg.setdefault("frro_use_expert_candidate", True)
+        adv_cfg.setdefault("frro_expert_candidate_weight", 2.0)
+        adv_cfg.setdefault("frro_expert_logprob_chunk_size", 4096)
+        adv_cfg.setdefault("frro_use_support_gate", False)
+        adv_cfg.setdefault("frro_support_logprob_min", -20.0)
+        adv_cfg.setdefault("frro_support_gate_temperature", 1.0)
     return adv_cfg
 
 
@@ -329,6 +355,196 @@ def _objective_baseline(values: np.ndarray, mode: str) -> float:
     if mode in {"median", "p50"}:
         return float(np.median(finite))
     return float(np.mean(finite))
+
+
+@dataclass
+class FrroExpertCandidate:
+    env_idx: int
+    observations: list[dict[str, np.ndarray]]
+    actions: list[int]
+    advantage: float
+    gate: float
+    old_mean_logprob: float = 0.0
+
+
+def _frro_improvement_stats(
+    objective_row: np.ndarray,
+    success_row: np.ndarray,
+    ref_obj: float,
+    adv_cfg: dict[str, Any],
+) -> tuple[float, float, float] | None:
+    succ_obj = objective_row[success_row & np.isfinite(objective_row)]
+    if succ_obj.size == 0 or not np.isfinite(ref_obj) or ref_obj <= 0.0:
+        return None
+    base_obj = _objective_baseline(succ_obj, str(adv_cfg.get("frro_gap_baseline", "mean")))
+    if not np.isfinite(base_obj):
+        return None
+    remaining_gap = float(base_obj) - float(ref_obj)
+    std_floor = max(float(adv_cfg.get("frro_std_floor", 5.0)), 0.0)
+    sigma = max(float(np.std(succ_obj)), std_floor)
+    gap_scale = max(float(adv_cfg.get("frro_gap_scale_coef", 1.0)), 0.0) * max(remaining_gap, 0.0)
+    gap_floor = max(float(adv_cfg.get("frro_gap_floor_ratio", 0.01)), 0.0) * float(ref_obj)
+    scale = max(sigma, gap_scale, gap_floor, 1e-8)
+    return float(base_obj), remaining_gap, scale
+
+
+def _frro_expert_gate(
+    *,
+    remaining_gap: float,
+    ref_obj: float,
+    current_success_objectives: np.ndarray,
+    memory_obj: float | None,
+    adv_cfg: dict[str, Any],
+) -> tuple[float, bool, float | None]:
+    quality_eta = max(float(adv_cfg.get("frro_quality_gate_eta", 0.05)), 1e-8)
+    quality_gate = float(np.clip(remaining_gap / (quality_eta * float(ref_obj) + 1e-8), 0.0, 1.0))
+    best_known = np.inf
+    if bool(adv_cfg.get("frro_use_current_falsification", True)) and current_success_objectives.size > 0:
+        best_known = min(best_known, float(np.min(current_success_objectives)))
+    if (
+        bool(adv_cfg.get("frro_use_memory_falsification", True))
+        and memory_obj is not None
+        and np.isfinite(memory_obj)
+        and memory_obj > 0.0
+    ):
+        best_known = min(best_known, float(memory_obj))
+
+    best_gap_ratio: float | None = None
+    memory_gate = 1.0
+    falsified = False
+    if np.isfinite(best_known):
+        margin = max(float(adv_cfg.get("frro_falsification_margin", 0.005)), 0.0)
+        eta = max(float(adv_cfg.get("frro_falsification_eta", 0.05)), 1e-8)
+        target_obj = float(ref_obj) * (1.0 - margin)
+        gate_gap = (best_known - target_obj) / max(float(ref_obj), 1e-8)
+        memory_gate = float(np.clip(gate_gap / eta, 0.0, 1.0))
+        best_gap_ratio = (best_known - float(ref_obj)) / max(float(ref_obj), 1e-8)
+        falsified = memory_gate <= 1e-6
+    return quality_gate * memory_gate, falsified, best_gap_ratio
+
+
+def _expert_route_mean_logprobs(
+    agent: Agent,
+    candidates: list[FrroExpertCandidate],
+    device: str | torch.device,
+    chunk_size: int,
+) -> torch.Tensor:
+    if not candidates:
+        return torch.empty(0, dtype=torch.float32, device=device)
+    route_sums: torch.Tensor | None = None
+    route_lens: torch.Tensor | None = None
+    observations: list[dict[str, np.ndarray]] = []
+    actions: list[int] = []
+    route_ids: list[int] = []
+    for route_idx, candidate in enumerate(candidates):
+        for obs, action in zip(candidate.observations, candidate.actions):
+            observations.append(obs)
+            actions.append(int(action))
+            route_ids.append(route_idx)
+
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, len(actions), chunk_size):
+        end = min(start + chunk_size, len(actions))
+        obs_batch = stack_observations(observations[start:end])
+        action_tensor = torch.as_tensor(np.asarray(actions[start:end], dtype=np.int64)[:, None], dtype=torch.long, device=device)
+        route_tensor = torch.as_tensor(np.asarray(route_ids[start:end], dtype=np.int64), dtype=torch.long, device=device)
+        _, logprob, _, _ = agent.get_action_and_value(obs_batch, action=action_tensor)
+        logprob_flat = logprob.reshape(-1)
+        if route_sums is None:
+            route_sums = torch.zeros(len(candidates), dtype=logprob_flat.dtype, device=logprob_flat.device)
+            route_lens = torch.zeros_like(route_sums)
+        route_sums.scatter_add_(0, route_tensor, logprob_flat)
+        route_lens.scatter_add_(0, route_tensor, torch.ones_like(logprob_flat))
+    assert route_sums is not None and route_lens is not None
+    return route_sums / route_lens.clamp_min(1.0)
+
+
+def _prepare_frro_expert_candidates(
+    agent: Agent,
+    batch,
+    cfg: dict[str, Any],
+    envs,
+    expert_buffer: ExpertReplayBuffer | None,
+    policy_best_objectives: dict[str, float] | None,
+    device: str | torch.device,
+) -> tuple[list[FrroExpertCandidate], dict[str, float]]:
+    adv_cfg = _advantage_config(cfg)
+    if not _frro_enabled(cfg) or expert_buffer is None or not bool(adv_cfg.get("frro_use_expert_candidate", True)):
+        return [], {}
+    num_envs = int(batch.actions.size(1))
+    n_traj = int(batch.actions.size(2))
+    objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
+    adv_clip = float(adv_cfg.get("frro_clip", 2.0))
+    expert_weight = float(adv_cfg.get("frro_expert_candidate_weight", 2.0))
+    candidates: list[FrroExpertCandidate] = []
+    best_gap_ratios: list[float] = []
+    for env_idx, env in enumerate(envs[:num_envs]):
+        instance_id = _env_instance_id(env)
+        traj = expert_buffer.trajectory_for_instance(instance_id)
+        if traj is None or traj.length <= 0:
+            continue
+        ref_obj = float(traj.objective_distance_km)
+        stats = _frro_improvement_stats(objective[env_idx], success[env_idx], ref_obj, adv_cfg)
+        if stats is None:
+            continue
+        base_obj, remaining_gap, scale = stats
+        del base_obj
+        expert_adv = float(np.clip((remaining_gap / scale), -adv_clip, adv_clip))
+        current_success = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
+        memory_obj = policy_best_objectives.get(instance_id) if policy_best_objectives is not None and instance_id is not None else None
+        gate, _, best_gap = _frro_expert_gate(
+            remaining_gap=remaining_gap,
+            ref_obj=ref_obj,
+            current_success_objectives=current_success,
+            memory_obj=memory_obj,
+            adv_cfg=adv_cfg,
+        )
+        if best_gap is not None:
+            best_gap_ratios.append(best_gap)
+        used_adv = expert_weight * gate * expert_adv
+        if not np.isfinite(used_adv) or abs(used_adv) <= 1e-8:
+            continue
+        candidates.append(
+            FrroExpertCandidate(
+                env_idx=env_idx,
+                observations=traj.observations,
+                actions=traj.actions,
+                advantage=used_adv,
+                gate=gate,
+            )
+        )
+
+    if candidates:
+        chunk_size = int(adv_cfg.get("frro_expert_logprob_chunk_size", 4096))
+        with torch.no_grad():
+            old_mean = _expert_route_mean_logprobs(agent, candidates, device, chunk_size).detach().float().cpu().numpy()
+        use_support_gate = bool(adv_cfg.get("frro_use_support_gate", False))
+        support_min = float(adv_cfg.get("frro_support_logprob_min", -20.0))
+        support_temp = max(float(adv_cfg.get("frro_support_gate_temperature", 1.0)), 1e-8)
+        kept: list[FrroExpertCandidate] = []
+        for candidate, old_logprob in zip(candidates, old_mean):
+            candidate.old_mean_logprob = float(old_logprob)
+            if use_support_gate:
+                support_gate = float(1.0 / (1.0 + np.exp(-(candidate.old_mean_logprob - support_min) / support_temp)))
+                candidate.advantage *= support_gate
+                candidate.gate *= support_gate
+            if abs(candidate.advantage) > 1e-8:
+                kept.append(candidate)
+        candidates = kept
+
+    adv_values = np.asarray([candidate.advantage for candidate in candidates], dtype=np.float64)
+    gates = np.asarray([candidate.gate for candidate in candidates], dtype=np.float64)
+    info = {
+        "frro_expert_adv_mean": float(adv_values.mean()) if adv_values.size else 0.0,
+        "frro_expert_adv_std": float(adv_values.std()) if adv_values.size else 0.0,
+        "frro_expert_gate_mean": float(gates.mean()) if gates.size else 0.0,
+        "frro_expert_gate_std": float(gates.std()) if gates.size else 0.0,
+        "frro_expert_num_routes": float(len(candidates)),
+        "frro_expert_weight": expert_weight,
+    }
+    if best_gap_ratios:
+        info["frro_best_gap_mean"] = float(np.mean(best_gap_ratios))
+    return candidates, info
 
 
 def _compute_gae_returns(batch, gamma: float, gae_lambda: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -489,6 +705,7 @@ def _solution_level_advantage_tensors(
         success_only = bool(adv_cfg.get("frro_success_only", True))
         positive_coef = float(adv_cfg.get("frro_positive_coef", 1.0))
         negative_coef = float(adv_cfg.get("frro_negative_coef", 1.0))
+        frro_mode = str(adv_cfg.get("frro_advantage_mode", "remaining_gap")).lower()
         falsification_margin = max(float(adv_cfg.get("frro_falsification_margin", 0.0)), 0.0)
         falsification_eta = max(float(adv_cfg.get("frro_falsification_eta", 0.05)), 1e-8)
         use_memory_falsification = bool(adv_cfg.get("frro_use_memory_falsification", True))
@@ -504,42 +721,64 @@ def _solution_level_advantage_tensors(
             ref_obj = expert_buffer.reference_objective(instance_id)
             if ref_obj is None or not np.isfinite(ref_obj) or ref_obj <= 0.0:
                 continue
-            row = (float(ref_obj) - objective[env_idx]) / max(frro_rho * float(ref_obj), 1e-8)
+            if frro_mode in {"gap", "gap_reduction", "remaining_gap", "remaining-gap", "improvement"}:
+                stats = _frro_improvement_stats(objective[env_idx], success[env_idx], float(ref_obj), adv_cfg)
+                if stats is None:
+                    continue
+                base_obj, remaining_gap, scale = stats
+                row = (base_obj - objective[env_idx]) / scale
+                current_success = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
+                memory_obj = policy_best_objectives.get(instance_id) if policy_best_objectives is not None and instance_id is not None else None
+                gate_value, is_falsified, best_gap = _frro_expert_gate(
+                    remaining_gap=remaining_gap,
+                    ref_obj=float(ref_obj),
+                    current_success_objectives=current_success,
+                    memory_obj=memory_obj,
+                    adv_cfg=adv_cfg,
+                )
+                if best_gap is not None:
+                    best_gap_ratios.append(best_gap)
+                falsified[env_idx, 0] = 1.0 if is_falsified else 0.0
+            else:
+                row = (float(ref_obj) - objective[env_idx]) / max(frro_rho * float(ref_obj), 1e-8)
+                best_known = np.inf
+                if use_current_falsification:
+                    succ_obj = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
+                    if succ_obj.size > 0:
+                        best_known = min(best_known, float(np.min(succ_obj)))
+                if (
+                    use_memory_falsification
+                    and policy_best_objectives is not None
+                    and instance_id is not None
+                ):
+                    memory_obj = policy_best_objectives.get(instance_id)
+                    if memory_obj is not None and np.isfinite(memory_obj) and memory_obj > 0.0:
+                        best_known = min(best_known, float(memory_obj))
+
+                if np.isfinite(best_known):
+                    target_obj = float(ref_obj) * (1.0 - falsification_margin)
+                    gate_gap = (best_known - target_obj) / max(float(ref_obj), 1e-8)
+                    gate_value = float(np.clip(gate_gap / falsification_eta, 0.0, 1.0))
+                    best_gap_ratios.append((best_known - float(ref_obj)) / max(float(ref_obj), 1e-8))
+                else:
+                    gate_value = 1.0
+                if gate_value <= 1e-6:
+                    falsified[env_idx, 0] = 1.0
             row[~np.isfinite(row)] = 0.0
             if success_only:
                 row = np.where(success[env_idx], row, 0.0)
 
             pos = np.clip(np.maximum(row, 0.0), 0.0, frro_clip) * positive_coef
             neg = np.clip(np.minimum(row, 0.0), -frro_clip, 0.0) * negative_coef
-
-            best_known = np.inf
-            if use_current_falsification:
-                succ_obj = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
-                if succ_obj.size > 0:
-                    best_known = min(best_known, float(np.min(succ_obj)))
-            if (
-                use_memory_falsification
-                and policy_best_objectives is not None
-                and instance_id is not None
-            ):
-                memory_obj = policy_best_objectives.get(instance_id)
-                if memory_obj is not None and np.isfinite(memory_obj) and memory_obj > 0.0:
-                    best_known = min(best_known, float(memory_obj))
-
-            if np.isfinite(best_known):
-                target_obj = float(ref_obj) * (1.0 - falsification_margin)
-                gate_gap = (best_known - target_obj) / max(float(ref_obj), 1e-8)
-                gate_value = float(np.clip(gate_gap / falsification_eta, 0.0, 1.0))
-                best_gap_ratios.append((best_known - float(ref_obj)) / max(float(ref_obj), 1e-8))
-            else:
-                gate_value = 1.0
             frro_gate[env_idx, 0] = gate_value
-            if gate_value <= 1e-6:
-                falsified[env_idx, 0] = 1.0
 
             frro_positive[env_idx] = pos
-            frro_negative[env_idx] = neg * gate_value
-            frro_adv[env_idx] = pos + neg * gate_value
+            if frro_mode in {"gap", "gap_reduction", "remaining_gap", "remaining-gap", "improvement"}:
+                frro_negative[env_idx] = neg
+                frro_adv[env_idx] = pos + neg
+            else:
+                frro_negative[env_idx] = neg * gate_value
+                frro_adv[env_idx] = pos + neg * gate_value
 
         frro_used = frro_adv * frro_coef
         route_adv += frro_used
@@ -705,6 +944,49 @@ def _compute_solution_level_ppo_loss(
         "sl_route_adv_mean": float(a.detach().mean().cpu().item()),
         "sl_route_adv_std": float(a.detach().std(unbiased=False).cpu().item()) if a.numel() > 1 else 0.0,
         "sl_num_routes_used": float(route_mask.sum().detach().cpu().item()),
+    }
+
+
+def _compute_frro_expert_candidate_loss(
+    agent: Agent,
+    candidates: list[FrroExpertCandidate],
+    cfg: dict[str, Any],
+    env_indices: np.ndarray,
+    device: str | torch.device,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    adv_cfg = _advantage_config(cfg)
+    selected_envs = {int(idx) for idx in np.asarray(env_indices, dtype=np.int64).reshape(-1)}
+    selected = [candidate for candidate in candidates if candidate.env_idx in selected_envs and abs(candidate.advantage) > 1e-8]
+    if not selected:
+        zero = torch.zeros((), dtype=torch.float32, device=device, requires_grad=True)
+        return zero, {
+            "frro_expert_loss": 0.0,
+            "frro_expert_ratio_mean": 1.0,
+            "frro_expert_ratio_std": 0.0,
+            "frro_expert_clip_frac": 0.0,
+            "frro_expert_adv_mean": 0.0,
+            "frro_expert_adv_std": 0.0,
+            "frro_expert_num_routes": 0.0,
+        }
+
+    chunk_size = int(adv_cfg.get("frro_expert_logprob_chunk_size", 4096))
+    new_mean_logprob = _expert_route_mean_logprobs(agent, selected, device, chunk_size)
+    old_mean_logprob = torch.as_tensor([candidate.old_mean_logprob for candidate in selected], dtype=new_mean_logprob.dtype, device=new_mean_logprob.device)
+    adv = torch.as_tensor([candidate.advantage for candidate in selected], dtype=new_mean_logprob.dtype, device=new_mean_logprob.device)
+    route_ratio = torch.exp(new_mean_logprob - old_mean_logprob.detach())
+    route_clip_eps = float((cfg.get("offline", {}) or {}).get("route_clip_eps", (cfg.get("offline", {}) or {}).get("sl_clip_coef", 0.20)))
+    unclipped = route_ratio * adv.detach()
+    clipped = torch.clamp(route_ratio, 1.0 - route_clip_eps, 1.0 + route_clip_eps) * adv.detach()
+    route_loss = -torch.minimum(unclipped, clipped).mean()
+    clip_frac = ((route_ratio > 1.0 + route_clip_eps) | (route_ratio < 1.0 - route_clip_eps)).float().mean()
+    return route_loss, {
+        "frro_expert_loss": float(route_loss.detach().cpu().item()),
+        "frro_expert_ratio_mean": float(route_ratio.detach().mean().cpu().item()),
+        "frro_expert_ratio_std": float(route_ratio.detach().std(unbiased=False).cpu().item()) if route_ratio.numel() > 1 else 0.0,
+        "frro_expert_clip_frac": float(clip_frac.detach().cpu().item()),
+        "frro_expert_adv_mean": float(adv.detach().mean().cpu().item()),
+        "frro_expert_adv_std": float(adv.detach().std(unbiased=False).cpu().item()) if adv.numel() > 1 else 0.0,
+        "frro_expert_num_routes": float(len(selected)),
     }
 
 
@@ -966,6 +1248,16 @@ def train_from_config(
         "frro_gate_std",
         "frro_falsified_rate",
         "frro_best_gap_mean",
+        "frro_expert_loss",
+        "frro_expert_ratio_mean",
+        "frro_expert_ratio_std",
+        "frro_expert_clip_frac",
+        "frro_expert_adv_mean",
+        "frro_expert_adv_std",
+        "frro_expert_gate_mean",
+        "frro_expert_gate_std",
+        "frro_expert_num_routes",
+        "frro_expert_weight",
         "offline_updates",
         "group_adv_mean",
         "group_adv_std",
@@ -1123,6 +1415,7 @@ def train_from_config(
                 route_bc_enabled = _is_route_bc_method(offline_method)
                 route_adv_tensor = None
                 route_success_tensor = None
+                frro_expert_candidates: list[FrroExpertCandidate] = []
                 if sl_enabled:
                     route_adv_tensor, route_success_tensor, adv_info = _solution_level_advantage_tensors(
                         batch,
@@ -1132,6 +1425,16 @@ def train_from_config(
                         device,
                         policy_best_objectives=policy_best_objectives,
                     )
+                    frro_expert_candidates, frro_expert_info = _prepare_frro_expert_candidates(
+                        agent,
+                        batch,
+                        cfg,
+                        envs,
+                        expert_buffer,
+                        policy_best_objectives,
+                        device,
+                    )
+                    adv_info.update(frro_expert_info)
                     # Gate the current batch with historical policy memory only;
                     # the current rollout becomes memory for subsequent epochs.
                     _update_policy_best_objectives(policy_best_objectives, batch, envs)
@@ -1180,6 +1483,13 @@ def train_from_config(
                 sl_adv_means: list[float] = []
                 sl_adv_stds: list[float] = []
                 sl_route_counts: list[float] = []
+                frro_expert_losses: list[float] = []
+                frro_expert_ratio_means: list[float] = []
+                frro_expert_ratio_stds: list[float] = []
+                frro_expert_clip_fracs: list[float] = []
+                frro_expert_adv_means: list[float] = []
+                frro_expert_adv_stds: list[float] = []
+                frro_expert_route_counts: list[float] = []
                 for _ in range(ppo_epochs):
                     np.random.shuffle(env_order)
                     split_indices = [indices for indices in np.array_split(env_order, minibatches) if indices.size > 0]
@@ -1215,6 +1525,7 @@ def train_from_config(
                                 weighted_policy += policy_loss.item() * chunk_weight
                                 weighted_value += value_loss.item() * chunk_weight
                                 weighted_entropy += entropy.item() * chunk_weight
+                            sl_coef = float(offline_cfg.get("sl_coef", offline_cfg.get("route_loss_coef", 0.10)))
                             if sl_enabled and route_adv_tensor is not None and route_success_tensor is not None:
                                 with _autocast_context(device, amp_enabled):
                                     route_loss, route_info = _compute_solution_level_ppo_loss(
@@ -1226,7 +1537,6 @@ def train_from_config(
                                         env_indices,
                                         device,
                                     )
-                                sl_coef = float(offline_cfg.get("sl_coef", offline_cfg.get("route_loss_coef", 0.10)))
                                 _backward(sl_coef * route_loss / group_size, scaler, amp_enabled)
                                 sl_losses.append(float(route_info["sl_route_loss"]))
                                 sl_ratio_means.append(float(route_info["sl_route_ratio_mean"]))
@@ -1235,6 +1545,23 @@ def train_from_config(
                                 sl_adv_means.append(float(route_info["sl_route_adv_mean"]))
                                 sl_adv_stds.append(float(route_info["sl_route_adv_std"]))
                                 sl_route_counts.append(float(route_info["sl_num_routes_used"]))
+                            if frro_expert_candidates:
+                                with _autocast_context(device, amp_enabled):
+                                    expert_loss, expert_info = _compute_frro_expert_candidate_loss(
+                                        agent,
+                                        frro_expert_candidates,
+                                        cfg,
+                                        env_indices,
+                                        device,
+                                    )
+                                _backward(sl_coef * expert_loss / group_size, scaler, amp_enabled)
+                                frro_expert_losses.append(float(expert_info["frro_expert_loss"]))
+                                frro_expert_ratio_means.append(float(expert_info["frro_expert_ratio_mean"]))
+                                frro_expert_ratio_stds.append(float(expert_info["frro_expert_ratio_std"]))
+                                frro_expert_clip_fracs.append(float(expert_info["frro_expert_clip_frac"]))
+                                frro_expert_adv_means.append(float(expert_info["frro_expert_adv_mean"]))
+                                frro_expert_adv_stds.append(float(expert_info["frro_expert_adv_std"]))
+                                frro_expert_route_counts.append(float(expert_info["frro_expert_num_routes"]))
                             group_policy += weighted_policy / group_size
                             group_value += weighted_value / group_size
                             group_entropy += weighted_entropy / group_size
@@ -1290,6 +1617,16 @@ def train_from_config(
                         "frro_gate_std": adv_info.get("frro_gate_std", 0.0),
                         "frro_falsified_rate": adv_info.get("frro_falsified_rate", 0.0),
                         "frro_best_gap_mean": adv_info.get("frro_best_gap_mean", 0.0),
+                        "frro_expert_loss": float(np.mean(frro_expert_losses)) if frro_expert_losses else 0.0,
+                        "frro_expert_ratio_mean": float(np.mean(frro_expert_ratio_means)) if frro_expert_ratio_means else 1.0,
+                        "frro_expert_ratio_std": float(np.mean(frro_expert_ratio_stds)) if frro_expert_ratio_stds else 0.0,
+                        "frro_expert_clip_frac": float(np.mean(frro_expert_clip_fracs)) if frro_expert_clip_fracs else 0.0,
+                        "frro_expert_adv_mean": float(np.mean(frro_expert_adv_means)) if frro_expert_adv_means else adv_info.get("frro_expert_adv_mean", 0.0),
+                        "frro_expert_adv_std": float(np.mean(frro_expert_adv_stds)) if frro_expert_adv_stds else adv_info.get("frro_expert_adv_std", 0.0),
+                        "frro_expert_gate_mean": adv_info.get("frro_expert_gate_mean", 0.0),
+                        "frro_expert_gate_std": adv_info.get("frro_expert_gate_std", 0.0),
+                        "frro_expert_num_routes": int(np.sum(frro_expert_route_counts)) if frro_expert_route_counts else int(adv_info.get("frro_expert_num_routes", 0)),
+                        "frro_expert_weight": adv_info.get("frro_expert_weight", 0.0),
                     }
                 if profile_timing:
                     _sync_cuda(device)
@@ -1341,6 +1678,8 @@ def train_from_config(
                     f"frro={_format_float(adv_info.get('frro_adv_mean', 0.0))} "
                     f"frro_gate={_format_float(adv_info.get('frro_gate_mean', 0.0))} "
                     f"frro_falsified={_format_float(adv_info.get('frro_falsified_rate', 0.0))} "
+                    f"frro_exp={_format_float(sl_info.get('frro_expert_loss', 0.0))}/"
+                    f"{_format_float(sl_info.get('frro_expert_num_routes', 0.0))} "
                     f"bc={_format_float(bc_info.get('bc_loss', 0.0))} "
                     f"bc_acc={_format_float(bc_info.get('bc_accuracy', 0.0))} "
                     f"route_bc={_format_float(bc_info.get('route_bc_loss', 0.0))} "
@@ -1441,6 +1780,16 @@ def train_from_config(
                     "frro_gate_std": sl_info.get("frro_gate_std", ""),
                     "frro_falsified_rate": sl_info.get("frro_falsified_rate", ""),
                     "frro_best_gap_mean": sl_info.get("frro_best_gap_mean", ""),
+                    "frro_expert_loss": sl_info.get("frro_expert_loss", ""),
+                    "frro_expert_ratio_mean": sl_info.get("frro_expert_ratio_mean", ""),
+                    "frro_expert_ratio_std": sl_info.get("frro_expert_ratio_std", ""),
+                    "frro_expert_clip_frac": sl_info.get("frro_expert_clip_frac", ""),
+                    "frro_expert_adv_mean": sl_info.get("frro_expert_adv_mean", ""),
+                    "frro_expert_adv_std": sl_info.get("frro_expert_adv_std", ""),
+                    "frro_expert_gate_mean": sl_info.get("frro_expert_gate_mean", ""),
+                    "frro_expert_gate_std": sl_info.get("frro_expert_gate_std", ""),
+                    "frro_expert_num_routes": sl_info.get("frro_expert_num_routes", ""),
+                    "frro_expert_weight": sl_info.get("frro_expert_weight", ""),
                     "offline_updates": offline_updates,
                     "group_adv_mean": adv_info.get("group_adv_mean", ""),
                     "group_adv_std": adv_info.get("group_adv_std", ""),

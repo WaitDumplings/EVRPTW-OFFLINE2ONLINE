@@ -83,19 +83,28 @@ offline:
   route_clip_eps: 0.2
   only_success_route_loss: true
 advantage:
-  use_group_advantage: true
-  group_adv_coef: 0.3
+  use_group_advantage: false
+  group_adv_coef: 0.0
   group_adv_clip: 3.0
   group_adv_std_floor: 5.0
   use_reference_advantage: false
   use_frro: true
-  frro_coef: 0.1
+  frro_coef: 1.0
+  frro_advantage_mode: remaining_gap
+  frro_gap_baseline: mean
+  frro_gap_floor_ratio: 0.01
+  frro_gap_scale_coef: 1.0
+  frro_std_floor: 5.0
   frro_rho: 0.1
   frro_clip: 2.0
   frro_success_only: true
   frro_positive_coef: 1.0
   frro_negative_coef: 1.0
+  frro_quality_gate_eta: 0.05
   frro_falsification_margin: 0.005
   frro_falsification_eta: 0.05
   frro_use_memory_falsification: true
   frro_use_current_falsification: true
+  frro_use_expert_candidate: true
+  frro_expert_candidate_weight: 2.0
+  frro_use_support_gate: false

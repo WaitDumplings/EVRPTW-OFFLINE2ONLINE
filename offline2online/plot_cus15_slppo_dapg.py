@@ -29,9 +29,15 @@ RUNS = [
         "linestyle": "-",
     },
     {
-        "label": "FRRO u4 + dyn + mem + DDE-KV",
-        "run_name": "O2O_CUS15_FRRO_DYN_MEM_DDE_KV_R40_U4_E1000",
+        "label": "FRRO u4 + dyn + mem + DDE-KV, alpha=0.10, lambda_E=2",
+        "run_name": "O2O_CUS15_FRRO_A010_LE2_DYN_MEM_DDE_KV_R40_U4_E1000",
         "color": "#111111",
+        "linestyle": "-",
+    },
+    {
+        "label": "FRRO u4 + dyn + mem + DDE-KV, alpha=0.10, lambda_E=4",
+        "run_name": "O2O_CUS15_FRRO_A010_LE4_DYN_MEM_DDE_KV_R40_U4_E1000",
+        "color": "#e45756",
         "linestyle": "-",
     },
     {

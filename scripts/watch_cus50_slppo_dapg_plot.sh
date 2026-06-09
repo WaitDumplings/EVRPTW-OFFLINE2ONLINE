@@ -16,6 +16,8 @@ while tmux has-session -t cus50_slppo_group_ref_1000 2>/dev/null \
   || tmux has-session -t cus50_slppo_group_ref_u4_dyn_1000 2>/dev/null \
   || tmux has-session -t cus50_slppo_group_ref_u4_dyn_mem_1000 2>/dev/null \
   || tmux has-session -t cus50_slppo_group_ref_u4_dyn_mem_dde_1000 2>/dev/null \
+  || tmux has-session -t cus50_frro_a010_le2_u4_dyn_mem_dde_1000 2>/dev/null \
+  || tmux has-session -t cus50_frro_a010_le4_u4_dyn_mem_dde_1000 2>/dev/null \
   || tmux has-session -t cus50_dapg_1000 2>/dev/null \
   || tmux has-session -t cus50_dapg_u4_1000 2>/dev/null \
   || tmux has-session -t cus50_dapg_u4_dyn_1000 2>/dev/null; do
