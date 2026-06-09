@@ -53,6 +53,8 @@ Main configs live in `configs/`:
 - `cus15_o2o_sl_ppo_group_ref_u4_1000.yaml`: Cus15 SL-PPO group + reference comparison run.
 - `cus50_o2o_sl_ppo_group_ref_1000.yaml`: Cus50 SL-PPO comparison run with group + reference route advantages.
 - `cus50_o2o_sl_ppo_group_ref_u4_1000.yaml`: Cus50 SL-PPO group + reference run with four PPO updates.
+- `cus15_o2o_frro_u4_dyn_mem_dde_1000.yaml`: Cus15 FRRO run with dynamic embedding, memory falsification, and DDE-KV.
+- `cus50_o2o_frro_u4_dyn_mem_dde_1000.yaml`: Cus50 FRRO run with dynamic embedding, memory falsification, and DDE-KV.
 
 Dynamic embedding is disabled by default. Graph token remains enabled. The trainer forces `env_fast` and supports AMP through `training.mixed_precision: true`.
 
@@ -95,6 +97,17 @@ To run PPO with auxiliary reference advantage:
 python -m offline2online.train --config cus5_o2o_ppo.yaml --seed 2005 --use-reference-advantage \
   --expert-solution-path results/offline_experts/dataset_v1/train/Cus5_Gurobi/gurobi_summary.csv
 ```
+
+## FRRO Semantics
+
+`offline.method: frro` is a solution-level PPO method that treats each solver route as a falsifiable reference, not as an action expert. It uses the same route-level clipped PPO ratio as SL-PPO, but the reference component becomes one-sided after falsification:
+
+```text
+delta_ref = (J_ref - J_policy_route) / (rho * J_ref)
+A_FRRO = max(delta_ref, 0) + gate_falsify * min(delta_ref, 0)
+```
+
+`gate_falsify` decays to zero once the current sampled routes or the historical policy memory beat the reference by `frro_falsification_margin`. After that point, the reference can still reward routes that improve beyond it, but it no longer penalizes the policy for not matching a potentially suboptimal solver solution. Group route advantage remains available to rank the current on-policy rollouts.
 
 ## Ablation Baselines
 
@@ -148,6 +161,7 @@ The Cus15 bundle is intended for reproducing the current update/dynamic comparis
 
 ```bash
 bash scripts/run_cus15_slppo_group_ref_u4_1000.sh
+bash scripts/run_cus15_frro_u4_dyn_mem_dde_1000.sh
 bash scripts/run_cus15_dapg_u4_1000.sh
 bash scripts/run_cus15_dapg_u4_dyn_1000.sh
 bash scripts/watch_cus15_slppo_dapg_plot.sh
@@ -174,6 +188,7 @@ The current Cus50 comparison uses the same seed, rollout length, graph token, an
 ```bash
 bash scripts/run_cus50_slppo_group_ref_1000.sh
 bash scripts/run_cus50_slppo_group_ref_u4_1000.sh
+bash scripts/run_cus50_frro_u4_dyn_mem_dde_1000.sh
 bash scripts/run_cus50_dapg_1000.sh
 bash scripts/run_cus50_dapg_u4_1000.sh
 bash scripts/run_cus50_dapg_u4_dyn_1000.sh

@@ -143,6 +143,14 @@ def _is_sl_ppo_method(method: str) -> bool:
     return method in {"sl_ppo", "sl-ppo", "slppo"}
 
 
+def _is_frro_method(method: str) -> bool:
+    return method in {"frro", "frro_ppo", "frro-ppo", "sl_frro", "sl-frro"}
+
+
+def _is_solution_level_method(method: str) -> bool:
+    return _is_sl_ppo_method(method) or _is_frro_method(method)
+
+
 def _is_route_bc_method(method: str) -> bool:
     return method in {"route_bc_ppo", "route-bc-ppo", "route_bc", "route-bc", "route_sl_ppo"}
 
@@ -184,11 +192,22 @@ def _advantage_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "use_reference_memory_gate",
         "reference_memory_gate_eta",
         "reference_memory_margin",
+        "use_frro",
+        "frro_coef",
+        "frro_rho",
+        "frro_clip",
+        "frro_success_only",
+        "frro_positive_coef",
+        "frro_negative_coef",
+        "frro_falsification_margin",
+        "frro_falsification_eta",
+        "frro_use_memory_falsification",
+        "frro_use_current_falsification",
         "renormalize_after_aux_advantage",
     ):
         if key in offline_cfg and key not in adv_cfg:
             adv_cfg[key] = offline_cfg[key]
-    if _is_sl_ppo_method(method):
+    if _is_solution_level_method(method):
         adv_cfg.setdefault("use_reference_advantage", True)
         adv_cfg.setdefault("reference_adv_coef", 0.10)
         adv_cfg.setdefault("reference_advantage_mode", "absolute")
@@ -200,6 +219,23 @@ def _advantage_config(cfg: dict[str, Any]) -> dict[str, Any]:
         adv_cfg.setdefault("use_reference_soft_gate", True)
         adv_cfg.setdefault("reference_soft_gate_eta", 0.05)
         adv_cfg.setdefault("reference_policy_estimate", "best")
+    if _is_frro_method(method):
+        adv_cfg["use_reference_advantage"] = False
+        adv_cfg.setdefault("use_group_advantage", True)
+        adv_cfg.setdefault("group_adv_coef", 0.30)
+        adv_cfg.setdefault("group_adv_clip", 3.0)
+        adv_cfg.setdefault("group_adv_std_floor", 5.0)
+        adv_cfg.setdefault("use_frro", True)
+        adv_cfg.setdefault("frro_coef", 0.10)
+        adv_cfg.setdefault("frro_rho", 0.10)
+        adv_cfg.setdefault("frro_clip", 2.0)
+        adv_cfg.setdefault("frro_success_only", True)
+        adv_cfg.setdefault("frro_positive_coef", 1.0)
+        adv_cfg.setdefault("frro_negative_coef", 1.0)
+        adv_cfg.setdefault("frro_falsification_margin", 0.005)
+        adv_cfg.setdefault("frro_falsification_eta", 0.05)
+        adv_cfg.setdefault("frro_use_memory_falsification", True)
+        adv_cfg.setdefault("frro_use_current_falsification", True)
     return adv_cfg
 
 
@@ -211,6 +247,12 @@ def _group_advantage_enabled(cfg: dict[str, Any]) -> bool:
 def _reference_advantage_enabled(cfg: dict[str, Any]) -> bool:
     adv_cfg = _advantage_config(cfg)
     return bool(adv_cfg.get("use_reference_advantage", False)) or float(adv_cfg.get("reference_adv_coef", 0.0) or 0.0) != 0.0
+
+
+def _frro_enabled(cfg: dict[str, Any]) -> bool:
+    method = _offline_method(cfg)
+    adv_cfg = _advantage_config(cfg)
+    return _is_frro_method(method) or bool(adv_cfg.get("use_frro", False))
 
 
 def _env_instance_id(env) -> str | None:
@@ -392,6 +434,7 @@ def _solution_level_advantage_tensors(
     adv_cfg = _advantage_config(cfg)
     use_group = _group_advantage_enabled(cfg)
     use_ref = _reference_advantage_enabled(cfg)
+    use_frro = _frro_enabled(cfg)
     num_envs = int(batch.actions.size(1))
     n_traj = int(batch.actions.size(2))
     objective, success, served = _final_info_arrays(batch.final_infos, num_envs, n_traj)
@@ -408,6 +451,16 @@ def _solution_level_advantage_tensors(
         "ref_memory_better_rate": 0.0,
         "ref_memory_gap_mean": 0.0,
         "ref_base_gap_ratio_mean": 0.0,
+        "frro_adv_mean": 0.0,
+        "frro_adv_std": 0.0,
+        "frro_positive_mean": 0.0,
+        "frro_positive_std": 0.0,
+        "frro_negative_mean": 0.0,
+        "frro_negative_std": 0.0,
+        "frro_gate_mean": 0.0,
+        "frro_gate_std": 0.0,
+        "frro_falsified_rate": 0.0,
+        "frro_best_gap_mean": 0.0,
         "route_adv_mean": 0.0,
         "route_adv_std": 0.0,
     }
@@ -428,6 +481,75 @@ def _solution_level_advantage_tensors(
         group_adv *= float(adv_cfg.get("group_adv_coef", 0.30))
         route_adv += group_adv
         info["group_adv_mean"], info["group_adv_std"] = _finite_mean_std(group_adv)
+
+    if use_frro and expert_buffer is not None:
+        frro_coef = float(adv_cfg.get("frro_coef", 0.10))
+        frro_rho = max(float(adv_cfg.get("frro_rho", 0.10)), 1e-8)
+        frro_clip = float(adv_cfg.get("frro_clip", 2.0))
+        success_only = bool(adv_cfg.get("frro_success_only", True))
+        positive_coef = float(adv_cfg.get("frro_positive_coef", 1.0))
+        negative_coef = float(adv_cfg.get("frro_negative_coef", 1.0))
+        falsification_margin = max(float(adv_cfg.get("frro_falsification_margin", 0.0)), 0.0)
+        falsification_eta = max(float(adv_cfg.get("frro_falsification_eta", 0.05)), 1e-8)
+        use_memory_falsification = bool(adv_cfg.get("frro_use_memory_falsification", True))
+        use_current_falsification = bool(adv_cfg.get("frro_use_current_falsification", True))
+        frro_adv = np.zeros((num_envs, n_traj), dtype=np.float64)
+        frro_positive = np.zeros_like(frro_adv)
+        frro_negative = np.zeros_like(frro_adv)
+        frro_gate = np.zeros((num_envs, 1), dtype=np.float64)
+        falsified = np.zeros((num_envs, 1), dtype=np.float64)
+        best_gap_ratios: list[float] = []
+        for env_idx, env in enumerate(envs[:num_envs]):
+            instance_id = _env_instance_id(env)
+            ref_obj = expert_buffer.reference_objective(instance_id)
+            if ref_obj is None or not np.isfinite(ref_obj) or ref_obj <= 0.0:
+                continue
+            row = (float(ref_obj) - objective[env_idx]) / max(frro_rho * float(ref_obj), 1e-8)
+            row[~np.isfinite(row)] = 0.0
+            if success_only:
+                row = np.where(success[env_idx], row, 0.0)
+
+            pos = np.clip(np.maximum(row, 0.0), 0.0, frro_clip) * positive_coef
+            neg = np.clip(np.minimum(row, 0.0), -frro_clip, 0.0) * negative_coef
+
+            best_known = np.inf
+            if use_current_falsification:
+                succ_obj = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
+                if succ_obj.size > 0:
+                    best_known = min(best_known, float(np.min(succ_obj)))
+            if (
+                use_memory_falsification
+                and policy_best_objectives is not None
+                and instance_id is not None
+            ):
+                memory_obj = policy_best_objectives.get(instance_id)
+                if memory_obj is not None and np.isfinite(memory_obj) and memory_obj > 0.0:
+                    best_known = min(best_known, float(memory_obj))
+
+            if np.isfinite(best_known):
+                target_obj = float(ref_obj) * (1.0 - falsification_margin)
+                gate_gap = (best_known - target_obj) / max(float(ref_obj), 1e-8)
+                gate_value = float(np.clip(gate_gap / falsification_eta, 0.0, 1.0))
+                best_gap_ratios.append((best_known - float(ref_obj)) / max(float(ref_obj), 1e-8))
+            else:
+                gate_value = 1.0
+            frro_gate[env_idx, 0] = gate_value
+            if gate_value <= 1e-6:
+                falsified[env_idx, 0] = 1.0
+
+            frro_positive[env_idx] = pos
+            frro_negative[env_idx] = neg * gate_value
+            frro_adv[env_idx] = pos + neg * gate_value
+
+        frro_used = frro_adv * frro_coef
+        route_adv += frro_used
+        info["frro_adv_mean"], info["frro_adv_std"] = _finite_mean_std(frro_used)
+        info["frro_positive_mean"], info["frro_positive_std"] = _finite_mean_std(frro_positive * frro_coef)
+        info["frro_negative_mean"], info["frro_negative_std"] = _finite_mean_std(frro_negative * frro_coef)
+        info["frro_gate_mean"], info["frro_gate_std"] = _finite_mean_std(frro_gate)
+        info["frro_falsified_rate"] = float(falsified.mean())
+        if best_gap_ratios:
+            info["frro_best_gap_mean"] = float(np.mean(best_gap_ratios))
 
     if use_ref and expert_buffer is not None:
         ref_clip = float(adv_cfg.get("reference_adv_clip", 2.0))
@@ -589,11 +711,13 @@ def _compute_solution_level_ppo_loss(
 def _load_expert_buffer(cfg: dict[str, Any], seed: int, debug_enabled: bool, debug_file) -> ExpertReplayBuffer | None:
     offline_cfg = cfg.get("offline", {}) or {}
     method = _offline_method(cfg)
-    need_archive = _requires_expert_routes(method) or _reference_advantage_enabled(cfg)
+    need_archive = _requires_expert_routes(method) or _reference_advantage_enabled(cfg) or _frro_enabled(cfg)
     if method in {"", "none", "ppo"} and not need_archive:
         return None
     if _is_sl_ppo_method(method):
         need_archive = _reference_advantage_enabled(cfg)
+    if _is_frro_method(method):
+        need_archive = True
     if not need_archive:
         return None
     solution_path = offline_cfg.get("expert_solution_path") or offline_cfg.get("expert_csv_path")
@@ -832,6 +956,16 @@ def train_from_config(
         "sl_ref_memory_better_rate",
         "sl_ref_memory_gap_mean",
         "sl_ref_base_gap_ratio_mean",
+        "frro_adv_mean",
+        "frro_adv_std",
+        "frro_positive_mean",
+        "frro_positive_std",
+        "frro_negative_mean",
+        "frro_negative_std",
+        "frro_gate_mean",
+        "frro_gate_std",
+        "frro_falsified_rate",
+        "frro_best_gap_mean",
         "offline_updates",
         "group_adv_mean",
         "group_adv_std",
@@ -985,7 +1119,7 @@ def train_from_config(
                 adv_vals = advantages[batch.valid]
                 if adv_vals.numel() > 1:
                     advantages = (advantages - adv_vals.mean()) / (adv_vals.std(unbiased=False) + 1e-8)
-                sl_enabled = _is_sl_ppo_method(offline_method)
+                sl_enabled = _is_solution_level_method(offline_method)
                 route_bc_enabled = _is_route_bc_method(offline_method)
                 route_adv_tensor = None
                 route_success_tensor = None
@@ -1146,6 +1280,16 @@ def train_from_config(
                         "sl_ref_memory_better_rate": adv_info.get("ref_memory_better_rate", 0.0),
                         "sl_ref_memory_gap_mean": adv_info.get("ref_memory_gap_mean", 0.0),
                         "sl_ref_base_gap_ratio_mean": adv_info.get("ref_base_gap_ratio_mean", 0.0),
+                        "frro_adv_mean": adv_info.get("frro_adv_mean", 0.0),
+                        "frro_adv_std": adv_info.get("frro_adv_std", 0.0),
+                        "frro_positive_mean": adv_info.get("frro_positive_mean", 0.0),
+                        "frro_positive_std": adv_info.get("frro_positive_std", 0.0),
+                        "frro_negative_mean": adv_info.get("frro_negative_mean", 0.0),
+                        "frro_negative_std": adv_info.get("frro_negative_std", 0.0),
+                        "frro_gate_mean": adv_info.get("frro_gate_mean", 0.0),
+                        "frro_gate_std": adv_info.get("frro_gate_std", 0.0),
+                        "frro_falsified_rate": adv_info.get("frro_falsified_rate", 0.0),
+                        "frro_best_gap_mean": adv_info.get("frro_best_gap_mean", 0.0),
                     }
                 if profile_timing:
                     _sync_cuda(device)
@@ -1194,6 +1338,9 @@ def train_from_config(
                     f"{_format_float(adv_info.get('ref_adv_std', 0.0))} "
                     f"ref_gap={_format_float(adv_info.get('ref_base_gap_ratio_mean', 0.0))} "
                     f"ref_mem_gate={_format_float(adv_info.get('ref_memory_gate_mean', 0.0))} "
+                    f"frro={_format_float(adv_info.get('frro_adv_mean', 0.0))} "
+                    f"frro_gate={_format_float(adv_info.get('frro_gate_mean', 0.0))} "
+                    f"frro_falsified={_format_float(adv_info.get('frro_falsified_rate', 0.0))} "
                     f"bc={_format_float(bc_info.get('bc_loss', 0.0))} "
                     f"bc_acc={_format_float(bc_info.get('bc_accuracy', 0.0))} "
                     f"route_bc={_format_float(bc_info.get('route_bc_loss', 0.0))} "
@@ -1284,6 +1431,16 @@ def train_from_config(
                     "sl_ref_memory_better_rate": sl_info.get("sl_ref_memory_better_rate", ""),
                     "sl_ref_memory_gap_mean": sl_info.get("sl_ref_memory_gap_mean", ""),
                     "sl_ref_base_gap_ratio_mean": sl_info.get("sl_ref_base_gap_ratio_mean", ""),
+                    "frro_adv_mean": sl_info.get("frro_adv_mean", ""),
+                    "frro_adv_std": sl_info.get("frro_adv_std", ""),
+                    "frro_positive_mean": sl_info.get("frro_positive_mean", ""),
+                    "frro_positive_std": sl_info.get("frro_positive_std", ""),
+                    "frro_negative_mean": sl_info.get("frro_negative_mean", ""),
+                    "frro_negative_std": sl_info.get("frro_negative_std", ""),
+                    "frro_gate_mean": sl_info.get("frro_gate_mean", ""),
+                    "frro_gate_std": sl_info.get("frro_gate_std", ""),
+                    "frro_falsified_rate": sl_info.get("frro_falsified_rate", ""),
+                    "frro_best_gap_mean": sl_info.get("frro_best_gap_mean", ""),
                     "offline_updates": offline_updates,
                     "group_adv_mean": adv_info.get("group_adv_mean", ""),
                     "group_adv_std": adv_info.get("group_adv_std", ""),

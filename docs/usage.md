@@ -39,6 +39,8 @@ Main configs live in `configs/`.
 | `cus15_o2o_sl_ppo_group_ref_u4_1000.yaml` | Cus15 SL-PPO group + reference 1000-epoch comparison config. |
 | `cus50_o2o_sl_ppo_group_ref_1000.yaml` | Cus50 SL-PPO comparison config with route-level group + reference advantages. |
 | `cus50_o2o_sl_ppo_group_ref_u4_1000.yaml` | Cus50 SL-PPO group + reference config with four PPO updates. |
+| `cus15_o2o_frro_u4_dyn_mem_dde_1000.yaml` | Cus15 FRRO config using dynamic embedding, memory falsification, and DDE-KV. |
+| `cus50_o2o_frro_u4_dyn_mem_dde_1000.yaml` | Cus50 FRRO config using dynamic embedding, memory falsification, and DDE-KV. |
 | `cus5_o2o_full.yaml`, `cus15_o2o_full.yaml`, `cus50_o2o_full.yaml` | Basic PPO configs for different scales. |
 
 Default model/training choices:
@@ -79,6 +81,8 @@ L_SL = -E[min(r_route * A_route, clip(r_route) * A_route)]
 ```
 
 Solver routes are not inserted into the PPO ratio. They only supply reference objective values, and only the ablation imitation baselines directly supervise solver actions.
+
+FRRO (`offline.method: frro`) uses the same on-policy route-level PPO ratio, but replaces the symmetric reference term with a falsifiable reference objective. A route that beats the reference receives positive evidence. A route worse than the reference receives negative reference pressure only while neither current on-policy samples nor historical policy memory have beaten the reference by `advantage.frro_falsification_margin`. This lets a weak or time-limited solver solution stop acting as a teacher once the policy has falsified it.
 
 DAPG uses two stages:
 
@@ -205,6 +209,7 @@ For the current u4 and dynamic-embedding comparison, use:
 bash scripts/run_cus50_slppo_group_ref_u4_1000.sh
 bash scripts/run_cus50_dapg_u4_1000.sh
 bash scripts/run_cus50_dapg_u4_dyn_1000.sh
+bash scripts/run_cus50_frro_u4_dyn_mem_dde_1000.sh
 bash scripts/watch_cus50_slppo_dapg_plot.sh
 ```
 
@@ -228,7 +233,7 @@ The checked-in Cus15 server bundle mirrors the current u4 comparison while keepi
 - PPO updates: `training.ppo_update_epochs: 4`.
 - Environments: `training.num_envs_per_gpu: 640`.
 - Minibatches: `training.num_minibatches: 16`.
-- Model: graph token and attention bias enabled; dynamic embedding enabled only in the `*_dyn_*` DAPG config.
+- Model: graph token and attention bias enabled; dynamic embedding enabled in the `*_dyn_*` DAPG and FRRO+DDE configs.
 - Validation: full Cus15 validation split, `eval_n_traj: 50`, `eval_batch_size: 1000`.
 - Offline source: `EVRPTW_DB_ROOT/results/offline_experts/dataset_v1/train/Cus15_Gurobi_2h/gurobi_summary.csv`.
 
@@ -239,11 +244,12 @@ export EVRPTW_DB_ROOT=/path/to/EVRPTW-DB
 export PYTHON_BIN=/path/to/python
 ```
 
-Then launch the three comparison runs:
+Then launch the comparison runs:
 
 ```bash
 # GPU0 by default
 bash scripts/run_cus15_slppo_group_ref_u4_1000.sh
+bash scripts/run_cus15_frro_u4_dyn_mem_dde_1000.sh
 
 # GPU1 by default; override CUDA_DEVICE to schedule differently
 bash scripts/run_cus15_dapg_u4_1000.sh
@@ -262,7 +268,7 @@ Refresh the unified Cus15 plot while experiments run:
 bash scripts/watch_cus15_slppo_dapg_plot.sh
 ```
 
-The plot helper reads the three Cus15 `eval_log.csv` files and writes:
+The plot helper reads the Cus15 `eval_log.csv` files and writes:
 
 ```text
 results/figures/cus15_offline_dynamic_update_ablation_r40_e1000.png

@@ -29,6 +29,12 @@ RUNS = [
         "linestyle": "-",
     },
     {
+        "label": "FRRO u4 + dyn + mem + DDE-KV",
+        "run_name": "O2O_CUS15_FRRO_DYN_MEM_DDE_KV_R40_U4_E1000",
+        "color": "#111111",
+        "linestyle": "-",
+    },
+    {
         "label": "DAPG u4",
         "run_name": "O2O_CUS15_DAPG_R40_U4_E1000",
         "color": "#f58518",

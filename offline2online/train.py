@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-async-instance-prefetch", action="store_true")
     parser.add_argument("--async-instance-workers", type=int, default=None)
     parser.add_argument("--async-instance-queue-batches", type=int, default=None)
-    parser.add_argument("--offline-method", type=str, default=None, choices=["ppo", "bc_ppo", "dapg", "route_bc_ppo", "sl_ppo"])
+    parser.add_argument("--offline-method", type=str, default=None, choices=["ppo", "bc_ppo", "dapg", "route_bc_ppo", "sl_ppo", "frro"])
     parser.add_argument("--expert-solution-path", type=str, default=None)
     parser.add_argument("--expert-dataset-path", type=str, default=None)
     parser.add_argument("--expert-limit", type=int, default=None)
@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-adv-coef", type=float, default=None)
     parser.add_argument("--reference-adv-coef", type=float, default=None)
     parser.add_argument("--reference-adv-rho", type=float, default=None)
+    parser.add_argument("--frro-coef", type=float, default=None)
+    parser.add_argument("--frro-rho", type=float, default=None)
+    parser.add_argument("--frro-clip", type=float, default=None)
+    parser.add_argument("--frro-falsification-margin", type=float, default=None)
+    parser.add_argument("--frro-falsification-eta", type=float, default=None)
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--no-mixed-precision", action="store_true")
     parser.add_argument("--eval-interval", type=int, default=None)
@@ -168,6 +173,16 @@ def main() -> None:
         overrides["advantage"]["reference_adv_coef"] = args.reference_adv_coef
     if args.reference_adv_rho is not None:
         overrides["advantage"]["reference_adv_rho"] = args.reference_adv_rho
+    if args.frro_coef is not None:
+        overrides["advantage"]["frro_coef"] = args.frro_coef
+    if args.frro_rho is not None:
+        overrides["advantage"]["frro_rho"] = args.frro_rho
+    if args.frro_clip is not None:
+        overrides["advantage"]["frro_clip"] = args.frro_clip
+    if args.frro_falsification_margin is not None:
+        overrides["advantage"]["frro_falsification_margin"] = args.frro_falsification_margin
+    if args.frro_falsification_eta is not None:
+        overrides["advantage"]["frro_falsification_eta"] = args.frro_falsification_eta
     if args.eval_interval is not None:
         overrides["evaluation"]["eval_interval"] = args.eval_interval
     if args.eval_path is not None:
@@ -193,4 +208,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
