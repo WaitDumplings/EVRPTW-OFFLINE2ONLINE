@@ -1001,17 +1001,43 @@ def _decomposed_critic_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _decompose_distance_rewards(batch) -> dict[str, torch.Tensor]:
-    rewards = batch.rewards
-    boundary = torch.zeros_like(rewards)
-    internal = torch.zeros_like(rewards)
-    for step, obs in enumerate(batch.observations[: rewards.size(0)]):
-        last_node = torch.as_tensor(obs["last_node_idx"], device=rewards.device, dtype=batch.actions.dtype)
-        action = batch.actions[step].to(device=rewards.device)
+def _build_decomposed_rewards_from_actions(batch) -> dict[str, torch.Tensor]:
+    rewards_total = batch.rewards
+    rewards_boundary = torch.zeros_like(rewards_total)
+    rewards_internal = torch.zeros_like(rewards_total)
+    for step, obs in enumerate(batch.observations[: rewards_total.size(0)]):
+        last_node = torch.as_tensor(obs["last_node_idx"], device=rewards_total.device, dtype=batch.actions.dtype)
+        action = batch.actions[step].to(device=rewards_total.device)
         boundary_mask = (last_node == 0) | (action == 0)
-        boundary[step] = torch.where(boundary_mask, rewards[step], torch.zeros_like(rewards[step]))
-        internal[step] = torch.where(boundary_mask, torch.zeros_like(rewards[step]), rewards[step])
-    return {"total": rewards, "boundary": boundary, "internal": internal}
+        rewards_boundary[step] = torch.where(boundary_mask, rewards_total[step], torch.zeros_like(rewards_total[step]))
+        rewards_internal[step] = torch.where(boundary_mask, torch.zeros_like(rewards_total[step]), rewards_total[step])
+    return {"total": rewards_total, "boundary": rewards_boundary, "internal": rewards_internal}
+
+
+def _attach_decomposed_rewards(batch) -> dict[str, float]:
+    if not all(hasattr(batch, name) for name in ("rewards_total", "rewards_boundary", "rewards_internal")):
+        rewards = _build_decomposed_rewards_from_actions(batch)
+        batch.rewards_total = rewards["total"]
+        batch.rewards_boundary = rewards["boundary"]
+        batch.rewards_internal = rewards["internal"]
+    residual = batch.rewards_total - (batch.rewards_boundary + batch.rewards_internal)
+    step_abs = residual.abs()
+    episode_residual = residual.masked_fill(~batch.valid, 0.0).sum(dim=0)
+    return {
+        "reward_decomposition_max_abs_error": float(step_abs.max().detach().cpu().item()) if step_abs.numel() else 0.0,
+        "reward_decomposition_mean_abs_error": float(step_abs[batch.valid].mean().detach().cpu().item()) if batch.valid.any() else 0.0,
+        "episode_decomposition_max_abs_error": float(episode_residual.abs().max().detach().cpu().item()) if episode_residual.numel() else 0.0,
+        "episode_decomposition_mean_abs_error": float(episode_residual.abs().mean().detach().cpu().item()) if episode_residual.numel() else 0.0,
+    }
+
+
+def _decompose_distance_rewards(batch) -> dict[str, torch.Tensor]:
+    _attach_decomposed_rewards(batch)
+    return {
+        "total": batch.rewards_total,
+        "boundary": batch.rewards_boundary,
+        "internal": batch.rewards_internal,
+    }
 
 
 def _explained_variance(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> float:
@@ -1040,6 +1066,7 @@ def _compute_decomposed_returns_advantages(
     use_gae: bool,
     cfg: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, dict[str, float]]:
+    decomposition_error_info = _attach_decomposed_rewards(batch)
     rewards = _decompose_distance_rewards(batch)
     values = {
         "total": _value_head(batch.values, 0),
@@ -1073,7 +1100,7 @@ def _compute_decomposed_returns_advantages(
     else:
         actor_adv = _normalize_valid(advantages["total"], batch.valid)
 
-    info: dict[str, float] = {}
+    info: dict[str, float] = dict(decomposition_error_info)
     for name in ("total", "boundary", "internal"):
         mean, std = _stats(advantages[name], batch.valid)
         info[f"adv_{name}_mean"] = mean
@@ -2455,6 +2482,10 @@ def train_from_config(
         "internal_distance_mean",
         "boundary_share",
         "internal_share",
+        "reward_decomposition_max_abs_error",
+        "reward_decomposition_mean_abs_error",
+        "episode_decomposition_max_abs_error",
+        "episode_decomposition_mean_abs_error",
         "advantage_mode",
         "samples_seen",
         "num_envs",
@@ -2666,6 +2697,10 @@ def train_from_config(
                 "internal_distance_mean": 0.0,
                 "boundary_share": 0.0,
                 "internal_share": 0.0,
+                "reward_decomposition_max_abs_error": 0.0,
+                "reward_decomposition_mean_abs_error": 0.0,
+                "episode_decomposition_max_abs_error": 0.0,
+                "episode_decomposition_mean_abs_error": 0.0,
                 "advantage_mode": critic_cfg.get("advantage_mode", "total"),
             }
             bc_warmup_epochs = int(offline_cfg.get("bc_warmup_epochs", 0))
@@ -3277,6 +3312,10 @@ def train_from_config(
                     "internal_distance_mean": decomposed_info.get("internal_distance_mean", ""),
                     "boundary_share": decomposed_info.get("boundary_share", ""),
                     "internal_share": decomposed_info.get("internal_share", ""),
+                    "reward_decomposition_max_abs_error": decomposed_info.get("reward_decomposition_max_abs_error", ""),
+                    "reward_decomposition_mean_abs_error": decomposed_info.get("reward_decomposition_mean_abs_error", ""),
+                    "episode_decomposition_max_abs_error": decomposed_info.get("episode_decomposition_max_abs_error", ""),
+                    "episode_decomposition_mean_abs_error": decomposed_info.get("episode_decomposition_mean_abs_error", ""),
                     "advantage_mode": decomposed_info.get("advantage_mode", ""),
                     "samples_seen": pool.sample_count,
                     "num_envs": num_envs,

@@ -58,6 +58,26 @@ Main configs live in `configs/`:
 
 Dynamic embedding is disabled by default. Graph token remains enabled. The trainer forces `env_fast` and supports AMP through `training.mixed_precision: true`.
 
+## Backbone Freeze Protocol
+
+Before adding DDE or offline objectives, freeze the backbone with static decoder semantics and the distance-decomposed critic. Use the semantic checker first:
+
+```bash
+python -m offline2online.backbone_semantics --config configs/cus50_backbone_b2_decomp_total.yaml \
+  --seed 2005 --device cpu --num-envs 2 --n-traj 4 --rollout-steps 8
+```
+
+Backbone configs for the B0-B4 sequence are:
+
+- `cus50_backbone_b0_legacy_static_single_critic.yaml`: legacy-compatible static single-critic PPO path.
+- `cus50_backbone_b1_static_qkv_single_critic.yaml`: static Q/K/V/ActionKey decoder with single critic.
+- `cus50_backbone_b2_decomp_total.yaml`: three-head critic, actor advantage from normalized total GAE.
+- `cus50_backbone_b3_decomp_exact.yaml`: three-head critic, actor advantage from exact boundary + internal GAE sum.
+- `cus50_backbone_b4_decomp_balanced_0505.yaml`: separately normalized boundary/internal advantages, 0.5/0.5 weights.
+- `cus50_backbone_b4_decomp_balanced_0307.yaml`: separately normalized boundary/internal advantages, 0.3/0.7 weights.
+
+The decomposed reward semantics are: depot-related edges are `boundary`, all non-depot edges including charging-station edges are `internal`, and `reward_total = reward_boundary + reward_internal` at every transition.
+
 The optional Dynamic Decision Encoder (`model.use_dynamic_decision_encoder: true`) is implemented as a key/value-only decoder adapter. Its input schema is split into a routing-generic core and an EVRPTW constraint supplement:
 
 - Routing core: feasible frontier state, depot/customer/auxiliary node type, route membership, visit/order memory, current/previous candidate flags, current-to-candidate cost, return-to-depot cost, and depot-detour cost.
