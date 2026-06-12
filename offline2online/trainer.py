@@ -11,13 +11,20 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 
 from .integrations.evrptw_db import configure_evrptw_db
 
 EVRPTW_DB_ROOT = configure_evrptw_db()
 
-from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.rollout import collect_rollout, compute_returns, stack_observations
+from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.env_factory import make_terran_env
+from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.rollout import (
+    collect_rollout,
+    compute_returns,
+    sample_actions,
+    stack_observations,
+)
 from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.trainer import (
     _debug_log,
     _format_float,
@@ -148,6 +155,28 @@ def _is_frro_method(method: str) -> bool:
     return method in {"frro", "frro_ppo", "frro-ppo", "sl_frro", "sl-frro"}
 
 
+def _is_dapg_method(method: str) -> bool:
+    return method in {"dapg", "bc_dapg", "bc+ppo", "gadapg", "ga_dapg", "ga-dapg", "group_dapg", "group-dapg"}
+
+
+def _is_bafipo_method(method: str) -> bool:
+    return method in {"bafipo", "ba_fipo", "ba-fipo", "branch_aware_fipo", "branch-aware-fipo"}
+
+
+def _is_gcbpo_method(method: str) -> bool:
+    return method in {
+        "gcbpo",
+        "gcbpo_branch",
+        "gcbpo-branch",
+        "gcbpo_prefix",
+        "gcbpo-prefix",
+        "gcbpo_branch_pref",
+        "gcbpo-branch-pref",
+        "gcbpo_branch_prefix",
+        "gcbpo-branch-prefix",
+    }
+
+
 def _is_solution_level_method(method: str) -> bool:
     return _is_sl_ppo_method(method) or _is_frro_method(method)
 
@@ -157,7 +186,13 @@ def _is_route_bc_method(method: str) -> bool:
 
 
 def _requires_expert_routes(method: str) -> bool:
-    return method in {"bc_ppo", "bc-ppo", "dapg", "bc_dapg", "bc+ppo"} or _is_route_bc_method(method)
+    return (
+        method in {"bc_ppo", "bc-ppo"}
+        or _is_dapg_method(method)
+        or _is_bafipo_method(method)
+        or _is_gcbpo_method(method)
+        or _is_route_bc_method(method)
+    )
 
 
 def _offline_coef(offline_cfg: dict[str, Any], epoch: int) -> float:
@@ -232,6 +267,12 @@ def _advantage_config(cfg: dict[str, Any]) -> dict[str, Any]:
         adv_cfg.setdefault("use_reference_soft_gate", True)
         adv_cfg.setdefault("reference_soft_gate_eta", 0.05)
         adv_cfg.setdefault("reference_policy_estimate", "best")
+    if method in {"gadapg", "ga_dapg", "ga-dapg", "group_dapg", "group-dapg"}:
+        adv_cfg.setdefault("use_group_advantage", True)
+        adv_cfg.setdefault("group_adv_coef", 0.30)
+        adv_cfg.setdefault("group_adv_clip", 3.0)
+        adv_cfg.setdefault("group_adv_std_floor", 5.0)
+        adv_cfg.setdefault("renormalize_after_aux_advantage", True)
     if _is_frro_method(method):
         adv_cfg["use_reference_advantage"] = False
         adv_cfg["reference_adv_coef"] = 0.0
@@ -367,6 +408,48 @@ class FrroExpertCandidate:
     old_mean_logprob: float = 0.0
 
 
+@dataclass
+class BafipoIncumbentCandidate:
+    env_idx: int
+    observations: list[dict[str, np.ndarray]]
+    actions: list[int]
+    objective: float
+    old_mean_logprob: float = 0.0
+
+
+@dataclass(frozen=True)
+class BafipoPreferencePair:
+    env_idx: int
+    pos_kind: str
+    pos_traj: int
+    neg_kind: str
+    neg_traj: int
+    old_delta: float
+    weight: float
+    incumbent_pair: bool
+
+
+@dataclass
+class GcbpoBranchCandidate:
+    env_idx: int
+    observations: list[dict[str, np.ndarray]]
+    actions: list[int]
+    objective: float
+    prefix_len: int
+    prefix_weight: float
+    old_mean_logprob: float = 0.0
+
+
+@dataclass(frozen=True)
+class GcbpoPreferencePair:
+    env_idx: int
+    branch_idx: int
+    neg_traj: int
+    old_delta: float
+    weight: float
+    strong: bool
+
+
 def _frro_improvement_stats(
     objective_row: np.ndarray,
     success_row: np.ndarray,
@@ -425,7 +508,7 @@ def _frro_expert_gate(
 
 def _expert_route_mean_logprobs(
     agent: Agent,
-    candidates: list[FrroExpertCandidate],
+    candidates: list[Any],
     device: str | torch.device,
     chunk_size: int,
 ) -> torch.Tensor:
@@ -545,6 +628,287 @@ def _prepare_frro_expert_candidates(
     if best_gap_ratios:
         info["frro_best_gap_mean"] = float(np.mean(best_gap_ratios))
     return candidates, info
+
+
+def _policy_route_old_mean_logprobs(batch) -> np.ndarray:
+    old_logprobs = batch.old_logprobs.detach().float().cpu().numpy()
+    valid = batch.valid.detach().float().cpu().numpy()
+    sums = (old_logprobs * valid).sum(axis=0)
+    counts = valid.sum(axis=0)
+    return np.divide(sums, np.maximum(counts, 1.0), out=np.zeros_like(sums), where=counts > 0)
+
+
+def _bafipo_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    adv_cfg = cfg.get("advantage", {}) or {}
+    offline_cfg = {**adv_cfg, **(cfg.get("offline", {}) or {})}
+    return {
+        "pref_coef": float(offline_cfg.get("bafipo_pref_coef", 0.05)),
+        "beta": float(offline_cfg.get("bafipo_beta", 1.0)),
+        "policy_pairs_per_instance": int(offline_cfg.get("bafipo_policy_pairs_per_instance", 16)),
+        "incumbent_pairs_per_instance": int(offline_cfg.get("bafipo_incumbent_pairs_per_instance", 8)),
+        "top_quantile": float(offline_cfg.get("bafipo_top_quantile", 0.20)),
+        "bottom_quantile": float(offline_cfg.get("bafipo_bottom_quantile", 0.20)),
+        "gap_floor_ratio": float(offline_cfg.get("bafipo_gap_floor_ratio", 0.01)),
+        "pair_weight_max": float(offline_cfg.get("bafipo_pair_weight_max", 2.0)),
+        "quality_eta": max(float(offline_cfg.get("bafipo_quality_eta", 0.05)), 1e-8),
+        "memory_margin": max(float(offline_cfg.get("bafipo_memory_margin", 0.005)), 0.0),
+        "memory_eta": max(float(offline_cfg.get("bafipo_memory_eta", 0.05)), 1e-8),
+        "spread_min": max(float(offline_cfg.get("bafipo_spread_min", 0.005)), 1e-8),
+        "allow_incumbent_negative": bool(offline_cfg.get("bafipo_allow_incumbent_negative", False)),
+        "expert_logprob_chunk_size": int(offline_cfg.get("bafipo_expert_logprob_chunk_size", offline_cfg.get("frro_expert_logprob_chunk_size", 4096))),
+    }
+
+
+def _prepare_bafipo_preference_pairs(
+    agent: Agent,
+    batch,
+    cfg: dict[str, Any],
+    envs,
+    expert_buffer: ExpertReplayBuffer | None,
+    policy_best_objectives: dict[str, float] | None,
+    device: str | torch.device,
+) -> tuple[list[BafipoPreferencePair], list[BafipoIncumbentCandidate], dict[str, float]]:
+    if expert_buffer is None:
+        return [], [], {}
+    bafipo_cfg = _bafipo_config(cfg)
+    num_envs = int(batch.actions.size(1))
+    n_traj = int(batch.actions.size(2))
+    objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
+    old_policy = _policy_route_old_mean_logprobs(batch)
+    pairs: list[BafipoPreferencePair] = []
+    incumbents: list[BafipoIncumbentCandidate] = []
+    pending_inc_pairs: list[tuple[int, int, float, bool]] = []
+    policy_pairs = 0
+    incumbent_pair_count = 0
+    weights: list[float] = []
+    quality_gates: list[float] = []
+    memory_gates: list[float] = []
+    spread_gates: list[float] = []
+    inc_beats_best = 0
+    inc_beats_mean = 0
+    inc_compared = 0
+    top_quantile = max(min(float(bafipo_cfg["top_quantile"]), 1.0), 1e-6)
+    bottom_quantile = max(min(float(bafipo_cfg["bottom_quantile"]), 1.0), 1e-6)
+    for env_idx, env in enumerate(envs[:num_envs]):
+        succ_idx = np.where(success[env_idx] & np.isfinite(objective[env_idx]))[0]
+        if succ_idx.size < 2:
+            continue
+        succ_obj = objective[env_idx, succ_idx].astype(np.float64)
+        mean_obj = float(np.mean(succ_obj))
+        std_obj = float(np.std(succ_obj))
+        scale = max(std_obj, float(bafipo_cfg["gap_floor_ratio"]) * max(mean_obj, 1e-8), 1e-8)
+        spread = std_obj / max(mean_obj, 1e-8)
+        spread_gate = float(np.clip(spread / float(bafipo_cfg["spread_min"]), 0.0, 1.0))
+        spread_gates.append(spread_gate)
+        if spread_gate <= 1e-8:
+            continue
+        order = succ_idx[np.argsort(objective[env_idx, succ_idx])]
+        n_top = max(1, int(np.ceil(top_quantile * order.size)))
+        n_bottom = max(1, int(np.ceil(bottom_quantile * order.size)))
+        top = order[:n_top]
+        bottom = order[-n_bottom:][::-1]
+        max_policy_pairs = max(0, int(bafipo_cfg["policy_pairs_per_instance"]))
+        for k in range(max_policy_pairs):
+            pos = int(top[k % len(top)])
+            neg = int(bottom[k % len(bottom)])
+            gap = float(objective[env_idx, neg] - objective[env_idx, pos])
+            if gap <= 1e-8:
+                continue
+            weight = spread_gate * float(np.clip(gap / scale, 0.0, float(bafipo_cfg["pair_weight_max"])))
+            if weight <= 1e-8:
+                continue
+            pairs.append(
+                BafipoPreferencePair(
+                    env_idx=env_idx,
+                    pos_kind="policy",
+                    pos_traj=pos,
+                    neg_kind="policy",
+                    neg_traj=neg,
+                    old_delta=float(old_policy[env_idx, pos] - old_policy[env_idx, neg]),
+                    weight=weight,
+                    incumbent_pair=False,
+                )
+            )
+            policy_pairs += 1
+            weights.append(weight)
+
+        instance_id = _env_instance_id(env)
+        traj = expert_buffer.trajectory_for_instance(instance_id)
+        if traj is None or traj.length <= 0:
+            continue
+        ref_obj = float(traj.objective_distance_km)
+        if not np.isfinite(ref_obj) or ref_obj <= 0.0:
+            continue
+        incumbent_idx = len(incumbents)
+        incumbents.append(
+            BafipoIncumbentCandidate(
+                env_idx=env_idx,
+                observations=traj.observations,
+                actions=traj.actions,
+                objective=ref_obj,
+            )
+        )
+        quality_gap = (mean_obj - ref_obj) / max(float(bafipo_cfg["quality_eta"]) * ref_obj, 1e-8)
+        quality_gate = float(np.clip(quality_gap, 0.0, 1.0))
+        memory_gate = 1.0
+        memory_obj = policy_best_objectives.get(instance_id) if policy_best_objectives is not None and instance_id is not None else None
+        if memory_obj is not None and np.isfinite(memory_obj) and memory_obj > 0.0:
+            target = ref_obj * (1.0 - float(bafipo_cfg["memory_margin"]))
+            memory_gate = float(np.clip((memory_obj - target) / max(float(bafipo_cfg["memory_eta"]) * ref_obj, 1e-8), 0.0, 1.0))
+        inc_gate = quality_gate * memory_gate
+        quality_gates.append(quality_gate)
+        memory_gates.append(memory_gate)
+        best_policy = float(np.min(succ_obj))
+        if ref_obj < best_policy:
+            inc_beats_best += 1
+        if ref_obj < mean_obj:
+            inc_beats_mean += 1
+        inc_compared += 1
+        if inc_gate <= 1e-8:
+            continue
+        worse_policy = succ_idx[objective[env_idx, succ_idx] > ref_obj + 1e-8]
+        worse_policy = worse_policy[np.argsort(objective[env_idx, worse_policy])[::-1]]
+        max_inc_pairs = max(0, int(bafipo_cfg["incumbent_pairs_per_instance"]))
+        for k in range(min(max_inc_pairs, len(worse_policy))):
+            neg = int(worse_policy[k % len(worse_policy)])
+            gap = float(objective[env_idx, neg] - ref_obj)
+            weight = spread_gate * inc_gate * float(np.clip(gap / scale, 0.0, float(bafipo_cfg["pair_weight_max"])))
+            if weight <= 1e-8:
+                continue
+            pending_inc_pairs.append((incumbent_idx, neg, weight, False))
+            incumbent_pair_count += 1
+            weights.append(weight)
+        if bool(bafipo_cfg["allow_incumbent_negative"]):
+            better_policy = succ_idx[objective[env_idx, succ_idx] < ref_obj - 1e-8]
+            better_policy = better_policy[np.argsort(objective[env_idx, better_policy])]
+            for k in range(min(max_inc_pairs, len(better_policy))):
+                pos = int(better_policy[k % len(better_policy)])
+                gap = float(ref_obj - objective[env_idx, pos])
+                weight = spread_gate * inc_gate * float(np.clip(gap / scale, 0.0, float(bafipo_cfg["pair_weight_max"])))
+                if weight <= 1e-8:
+                    continue
+                pending_inc_pairs.append((incumbent_idx, pos, weight, True))
+                incumbent_pair_count += 1
+                weights.append(weight)
+
+    if pending_inc_pairs and incumbents:
+        chunk_size = max(1, int(bafipo_cfg["expert_logprob_chunk_size"]))
+        with torch.no_grad():
+            old_inc = _expert_route_mean_logprobs(agent, incumbents, device, chunk_size).detach().float().cpu().numpy()
+        for candidate, old_val in zip(incumbents, old_inc):
+            candidate.old_mean_logprob = float(old_val)
+        for incumbent_idx, policy_traj, weight, incumbent_is_negative in pending_inc_pairs:
+            candidate = incumbents[incumbent_idx]
+            env_idx = int(candidate.env_idx)
+            if incumbent_is_negative:
+                old_delta = float(old_policy[env_idx, policy_traj] - candidate.old_mean_logprob)
+                pairs.append(
+                    BafipoPreferencePair(
+                        env_idx=env_idx,
+                        pos_kind="policy",
+                        pos_traj=int(policy_traj),
+                        neg_kind="incumbent",
+                        neg_traj=-1,
+                        old_delta=old_delta,
+                        weight=float(weight),
+                        incumbent_pair=True,
+                    )
+                )
+            else:
+                old_delta = float(candidate.old_mean_logprob - old_policy[env_idx, policy_traj])
+                pairs.append(
+                    BafipoPreferencePair(
+                        env_idx=env_idx,
+                        pos_kind="incumbent",
+                        pos_traj=-1,
+                        neg_kind="policy",
+                        neg_traj=int(policy_traj),
+                        old_delta=old_delta,
+                        weight=float(weight),
+                        incumbent_pair=True,
+                    )
+                )
+
+    info = {
+        "bafipo_pref_pairs": float(len(pairs)),
+        "bafipo_policy_pairs": float(policy_pairs),
+        "bafipo_incumbent_pairs": float(incumbent_pair_count),
+        "bafipo_quality_gate_mean": float(np.mean(quality_gates)) if quality_gates else 0.0,
+        "bafipo_memory_gate_mean": float(np.mean(memory_gates)) if memory_gates else 0.0,
+        "bafipo_spread_gate_mean": float(np.mean(spread_gates)) if spread_gates else 0.0,
+        "bafipo_incumbent_beats_best_rate": float(inc_beats_best / max(inc_compared, 1)),
+        "bafipo_incumbent_beats_mean_rate": float(inc_beats_mean / max(inc_compared, 1)),
+        "bafipo_pair_weight_mean": float(np.mean(weights)) if weights else 0.0,
+        "bafipo_pref_coef": float(bafipo_cfg["pref_coef"]),
+    }
+    return pairs, incumbents, info
+
+
+def _dapg_demo_gate_from_rollout(
+    batch,
+    cfg: dict[str, Any],
+    envs,
+    expert_buffer: ExpertReplayBuffer | None,
+    policy_best_objectives: dict[str, float] | None,
+) -> tuple[float, dict[str, float]]:
+    offline_cfg = cfg.get("offline", {}) or {}
+    method = _offline_method(cfg)
+    use_gate = bool(offline_cfg.get("use_dapg_demo_gate", method in {"gadapg", "ga_dapg", "ga-dapg", "group_dapg", "group-dapg"}))
+    if not use_gate or expert_buffer is None:
+        return 1.0, {
+            "dapg_demo_gate_mean": 1.0,
+            "dapg_demo_gate_std": 0.0,
+            "dapg_memory_better_rate": 0.0,
+            "dapg_memory_gap_mean": 0.0,
+        }
+
+    num_envs = int(batch.actions.size(1))
+    n_traj = int(batch.actions.size(2))
+    objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
+    eta = max(float(offline_cfg.get("dapg_demo_gate_eta", 0.05)), 1e-8)
+    margin = max(float(offline_cfg.get("dapg_demo_gate_margin", 0.0)), 0.0)
+    use_memory = bool(offline_cfg.get("use_dapg_memory_gate", True))
+    gates: list[float] = []
+    memory_better = 0
+    memory_gaps: list[float] = []
+    for env_idx, env in enumerate(envs[:num_envs]):
+        instance_id = _env_instance_id(env)
+        ref_obj = expert_buffer.reference_objective(instance_id)
+        if ref_obj is None or not np.isfinite(ref_obj) or ref_obj <= 0.0:
+            continue
+        best_known = np.inf
+        current_success = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
+        if current_success.size > 0:
+            best_known = min(best_known, float(np.min(current_success)))
+        if use_memory and policy_best_objectives is not None and instance_id is not None:
+            memory_obj = policy_best_objectives.get(instance_id)
+            if memory_obj is not None and np.isfinite(memory_obj) and memory_obj > 0.0:
+                best_known = min(best_known, float(memory_obj))
+        if not np.isfinite(best_known):
+            gates.append(1.0)
+            continue
+        target_obj = float(ref_obj) * (1.0 - margin)
+        gap_ratio = (best_known - target_obj) / max(float(ref_obj), 1e-8)
+        gate = float(np.clip(gap_ratio / eta, 0.0, 1.0))
+        gates.append(gate)
+        memory_gaps.append(float(gap_ratio))
+        if best_known <= target_obj:
+            memory_better += 1
+
+    if not gates:
+        return 1.0, {
+            "dapg_demo_gate_mean": 1.0,
+            "dapg_demo_gate_std": 0.0,
+            "dapg_memory_better_rate": 0.0,
+            "dapg_memory_gap_mean": 0.0,
+        }
+    gate_arr = np.asarray(gates, dtype=np.float64)
+    return float(gate_arr.mean()), {
+        "dapg_demo_gate_mean": float(gate_arr.mean()),
+        "dapg_demo_gate_std": float(gate_arr.std()),
+        "dapg_memory_better_rate": float(memory_better / max(len(gates), 1)),
+        "dapg_memory_gap_mean": float(np.mean(memory_gaps)) if memory_gaps else 0.0,
+    }
 
 
 def _compute_gae_returns(batch, gamma: float, gae_lambda: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -990,6 +1354,605 @@ def _compute_frro_expert_candidate_loss(
     }
 
 
+def _compute_bafipo_preference_loss(
+    agent: Agent,
+    batch,
+    pairs: list[BafipoPreferencePair],
+    incumbents: list[BafipoIncumbentCandidate],
+    cfg: dict[str, Any],
+    env_indices: np.ndarray,
+    device: str | torch.device,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    bafipo_cfg = _bafipo_config(cfg)
+    selected_envs = {int(idx) for idx in np.asarray(env_indices, dtype=np.int64).reshape(-1)}
+    selected_pairs = [pair for pair in pairs if pair.env_idx in selected_envs and pair.weight > 0.0]
+    if not selected_pairs:
+        zero = torch.zeros((), dtype=torch.float32, device=device, requires_grad=True)
+        return zero, {
+            "bafipo_pref_loss": 0.0,
+            "bafipo_pref_pair_count": 0.0,
+            "bafipo_policy_pair_count": 0.0,
+            "bafipo_incumbent_pair_count": 0.0,
+            "bafipo_pref_weight_mean": 0.0,
+            "bafipo_pref_logit_mean": 0.0,
+        }
+
+    env_indices = np.asarray(env_indices, dtype=np.int64)
+    env_to_local = {int(env_idx): local_idx for local_idx, env_idx in enumerate(env_indices)}
+    total_steps = int(batch.actions.size(0))
+    n_traj = int(batch.actions.size(2))
+    cached_state = agent.backbone.encode(_slice_obs_by_env(batch.observations[0], env_indices))
+    route_sums = torch.zeros((len(env_indices), n_traj), dtype=batch.old_logprobs.dtype, device=device)
+    route_counts = torch.zeros_like(route_sums)
+    for step in range(total_steps):
+        obs_mb = _slice_obs_by_env(batch.observations[step], env_indices)
+        actions = batch.actions[step, env_indices].long()
+        _, new_logprob, _, _, _ = agent.get_action_and_value_cached(obs_mb, action=actions, state=cached_state)
+        valid = batch.valid[step, env_indices].to(dtype=new_logprob.dtype)
+        route_sums = route_sums + new_logprob * valid
+        route_counts = route_counts + valid
+    policy_mean = route_sums / route_counts.clamp_min(1.0)
+
+    needed_inc_envs = {
+        pair.env_idx
+        for pair in selected_pairs
+        if pair.pos_kind == "incumbent" or pair.neg_kind == "incumbent"
+    }
+    selected_incumbents = [candidate for candidate in incumbents if candidate.env_idx in needed_inc_envs]
+    incumbent_logprob: dict[int, torch.Tensor] = {}
+    if selected_incumbents:
+        chunk_size = max(1, int(bafipo_cfg["expert_logprob_chunk_size"]))
+        inc_mean = _expert_route_mean_logprobs(agent, selected_incumbents, device, chunk_size)
+        incumbent_logprob = {candidate.env_idx: value for candidate, value in zip(selected_incumbents, inc_mean)}
+
+    pos_values: list[torch.Tensor] = []
+    neg_values: list[torch.Tensor] = []
+    old_deltas: list[float] = []
+    weights: list[float] = []
+    policy_pair_count = 0
+    incumbent_pair_count = 0
+    for pair in selected_pairs:
+        local_idx = env_to_local.get(pair.env_idx)
+        if local_idx is None:
+            continue
+
+        def route_value(kind: str, traj_idx: int) -> torch.Tensor | None:
+            if kind == "policy":
+                if traj_idx < 0 or traj_idx >= n_traj or route_counts[local_idx, traj_idx].item() <= 0:
+                    return None
+                return policy_mean[local_idx, traj_idx]
+            if kind == "incumbent":
+                return incumbent_logprob.get(pair.env_idx)
+            return None
+
+        pos = route_value(pair.pos_kind, pair.pos_traj)
+        neg = route_value(pair.neg_kind, pair.neg_traj)
+        if pos is None or neg is None:
+            continue
+        pos_values.append(pos)
+        neg_values.append(neg)
+        old_deltas.append(float(pair.old_delta))
+        weights.append(float(pair.weight))
+        if pair.incumbent_pair:
+            incumbent_pair_count += 1
+        else:
+            policy_pair_count += 1
+
+    if not pos_values:
+        zero = route_sums.sum() * 0.0
+        return zero, {
+            "bafipo_pref_loss": 0.0,
+            "bafipo_pref_pair_count": 0.0,
+            "bafipo_policy_pair_count": 0.0,
+            "bafipo_incumbent_pair_count": 0.0,
+            "bafipo_pref_weight_mean": 0.0,
+            "bafipo_pref_logit_mean": 0.0,
+        }
+
+    pos_t = torch.stack(pos_values)
+    neg_t = torch.stack(neg_values)
+    old_delta_t = torch.as_tensor(old_deltas, dtype=pos_t.dtype, device=pos_t.device)
+    weight_t = torch.as_tensor(weights, dtype=pos_t.dtype, device=pos_t.device)
+    beta = float(bafipo_cfg["beta"])
+    logits = beta * ((pos_t - neg_t) - old_delta_t.detach())
+    loss = -(weight_t.detach() * F.logsigmoid(logits)).mean()
+    return loss, {
+        "bafipo_pref_loss": float(loss.detach().cpu().item()),
+        "bafipo_pref_pair_count": float(len(weights)),
+        "bafipo_policy_pair_count": float(policy_pair_count),
+        "bafipo_incumbent_pair_count": float(incumbent_pair_count),
+        "bafipo_pref_weight_mean": float(weight_t.detach().mean().cpu().item()),
+        "bafipo_pref_logit_mean": float(logits.detach().mean().cpu().item()),
+    }
+
+
+
+def _parse_int_list_config(value: Any, default: list[int]) -> list[int]:
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        out = []
+        for part in value.split(','):
+            part = part.strip()
+            if part:
+                out.append(int(part))
+        return out or list(default)
+    if isinstance(value, (list, tuple)):
+        return [int(x) for x in value]
+    return list(default)
+
+
+def _gcbpo_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    adv_cfg = cfg.get("advantage", {}) or {}
+    offline_cfg = {**adv_cfg, **(cfg.get("offline", {}) or {})}
+    method = _offline_method(cfg)
+    prefix_default = 0.02 if method in {"gcbpo_prefix", "gcbpo-prefix", "gcbpo_branch_prefix", "gcbpo-branch-prefix"} else 0.0
+    return {
+        "branch_coef": float(offline_cfg.get("gcbpo_branch_coef", offline_cfg.get("gcbpo_pref_coef", 0.10))),
+        "prefix_coef": float(offline_cfg.get("gcbpo_prefix_coef", prefix_default)),
+        "beta": float(offline_cfg.get("gcbpo_beta", 1.0)),
+        "prefix_lengths": _parse_int_list_config(offline_cfg.get("gcbpo_prefix_lengths"), [1, 2, 3, 5, 8]),
+        "branch_completions_per_prefix": int(offline_cfg.get("gcbpo_branch_completions_per_prefix", 1)),
+        "branch_pairs_per_instance": int(offline_cfg.get("gcbpo_branch_pairs_per_instance", 8)),
+        "top_quantile": float(offline_cfg.get("gcbpo_top_quantile", 0.20)),
+        "bottom_quantile": float(offline_cfg.get("gcbpo_bottom_quantile", 0.20)),
+        "gap_floor_ratio": float(offline_cfg.get("gcbpo_gap_floor_ratio", 0.01)),
+        "pair_weight_max": float(offline_cfg.get("gcbpo_pair_weight_max", 2.0)),
+        "soft_weight_coef": float(offline_cfg.get("gcbpo_soft_weight_coef", 0.50)),
+        "margin_abs": float(offline_cfg.get("gcbpo_margin_abs", 0.0)),
+        "max_instances_per_epoch": int(offline_cfg.get("gcbpo_max_instances_per_epoch", 64)),
+        "expert_logprob_chunk_size": int(offline_cfg.get("gcbpo_expert_logprob_chunk_size", offline_cfg.get("frro_expert_logprob_chunk_size", 4096))),
+    }
+
+
+def _gcbpo_env_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    env_cfg = dict(cfg.get("env", {}) or {})
+    scale_mode = str(env_cfg.get("reward_distance_scale_mode", ""))
+    if scale_mode.startswith("dataset_"):
+        env_cfg["reward_distance_scale_mode"] = scale_mode[len("dataset_"):]
+    env_cfg["use_fast_env"] = True
+    env_cfg["info_level"] = "light"
+    return env_cfg
+
+
+def _env_instance(env):
+    candidates = [env, getattr(env, "unwrapped", None), getattr(env, "env", None)]
+    current = env
+    for _ in range(8):
+        current = getattr(current, "env", None)
+        if current is None:
+            break
+        candidates.extend([current, getattr(current, "unwrapped", None)])
+    for obj in candidates:
+        instance = getattr(obj, "instance", None) if obj is not None else None
+        if instance is not None:
+            return instance
+    return None
+
+
+def _copy_obs(obs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return {key: np.asarray(value).copy() for key, value in obs.items()}
+
+
+def _slice_obs_traj(obs: dict[str, np.ndarray], traj_idx: int) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    action_mask = np.asarray(obs.get("action_mask"))
+    n_traj = int(action_mask.shape[0]) if action_mask.ndim > 0 else 1
+    for key, value in obs.items():
+        arr = np.asarray(value)
+        if arr.ndim > 0 and arr.shape[0] == n_traj and int(traj_idx) < arr.shape[0]:
+            out[key] = arr[int(traj_idx) : int(traj_idx) + 1].copy()
+        else:
+            out[key] = arr.copy()
+    return out
+
+
+def _successful_obj_indices(objective_row: np.ndarray, success_row: np.ndarray) -> np.ndarray:
+    return np.where(success_row & np.isfinite(objective_row))[0]
+
+
+def _top_mean_objective(values: np.ndarray, q: float) -> float:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    n = max(1, int(np.ceil(max(min(float(q), 1.0), 1e-6) * finite.size)))
+    return float(np.mean(np.sort(finite)[:n]))
+
+
+def _complete_gcbpo_prefix_candidates(
+    agent: Agent,
+    instance: Any,
+    prefix_actions: list[int],
+    cfg: dict[str, Any],
+    *,
+    env_idx: int,
+    prefix_len: int,
+    prefix_weight: float,
+    completions: int,
+    max_steps: int,
+    device: str | torch.device,
+    seed: int,
+) -> tuple[list[GcbpoBranchCandidate], dict[str, float]]:
+    env = make_terran_env(
+        instance=instance,
+        n_traj=max(1, int(completions)),
+        pbrs_config=None,
+        **_gcbpo_env_cfg(cfg),
+    )
+    obs, info = env.reset(seed=int(seed))
+    n_traj = int(env.unwrapped.n_traj)
+    done = np.zeros(n_traj, dtype=bool)
+    step_obs: list[dict[str, np.ndarray]] = []
+    step_actions: list[np.ndarray] = []
+    step_alive: list[np.ndarray] = []
+    prefix_valid = True
+    invalid_step = -1
+    invalid_action = -1
+    with torch.no_grad():
+        for step_idx, action in enumerate(prefix_actions):
+            alive = ~done
+            if not bool(alive.any()):
+                prefix_valid = False
+                invalid_step = int(step_idx)
+                invalid_action = int(action)
+                break
+            action_i = int(action)
+            mask = np.asarray(obs["action_mask"], dtype=bool)
+            if action_i < 0 or action_i >= mask.shape[1] or not bool(mask[alive, action_i].all()):
+                prefix_valid = False
+                invalid_step = int(step_idx)
+                invalid_action = action_i
+                break
+            action_np = np.full(n_traj, action_i, dtype=np.int64)
+            step_obs.append(_copy_obs(obs))
+            step_actions.append(action_np.copy())
+            step_alive.append(alive.copy())
+            obs, reward, terminated, truncated, info = env.step(action_np)
+            done = done | np.asarray(terminated, dtype=bool) | np.asarray(truncated, dtype=bool)
+            if done.any() and step_idx + 1 < len(prefix_actions):
+                prefix_valid = False
+                invalid_step = int(step_idx)
+                invalid_action = action_i
+                break
+        if prefix_valid and not done.all():
+            for _ in range(max(0, int(max_steps) - len(prefix_actions))):
+                alive = ~done
+                if not bool(alive.any()):
+                    break
+                obs_batch = stack_observations([obs])
+                actions, _, _, _, _ = sample_actions(agent, obs_batch, decode_mode="sample", device=device)
+                action_np = actions.squeeze(0).detach().cpu().numpy().astype(np.int64)
+                step_obs.append(_copy_obs(obs))
+                step_actions.append(action_np.copy())
+                step_alive.append(alive.copy())
+                obs, reward, terminated, truncated, info = env.step(action_np)
+                done = done | np.asarray(terminated, dtype=bool) | np.asarray(truncated, dtype=bool)
+                if done.all():
+                    break
+    if not prefix_valid:
+        return [], {
+            "prefix_valid": 0.0,
+            "invalid_step": float(invalid_step),
+            "invalid_action": float(invalid_action),
+            "branch_success_count": 0.0,
+        }
+    success = np.asarray(info.get("success", []), dtype=bool).reshape(-1)
+    objective = np.asarray(info.get("objective_distance_km", []), dtype=np.float64).reshape(-1)
+    candidates: list[GcbpoBranchCandidate] = []
+    for traj_idx in range(min(n_traj, success.size, objective.size)):
+        if not bool(success[traj_idx]) or not np.isfinite(objective[traj_idx]):
+            continue
+        obs_list: list[dict[str, np.ndarray]] = []
+        act_list: list[int] = []
+        for obs_s, action_s, alive_s in zip(step_obs, step_actions, step_alive):
+            if bool(alive_s[traj_idx]):
+                obs_list.append(_slice_obs_traj(obs_s, traj_idx))
+                act_list.append(int(action_s[traj_idx]))
+        if act_list:
+            candidates.append(
+                GcbpoBranchCandidate(
+                    env_idx=int(env_idx),
+                    observations=obs_list,
+                    actions=act_list,
+                    objective=float(objective[traj_idx]),
+                    prefix_len=min(int(prefix_len), len(act_list)),
+                    prefix_weight=float(prefix_weight),
+                )
+            )
+    return candidates, {
+        "prefix_valid": 1.0,
+        "invalid_step": -1.0,
+        "invalid_action": -1.0,
+        "branch_success_count": float(len(candidates)),
+    }
+
+
+def _prepare_gcbpo_preference_pairs(
+    agent: Agent,
+    batch,
+    cfg: dict[str, Any],
+    envs,
+    expert_buffer: ExpertReplayBuffer | None,
+    device: str | torch.device,
+    epoch: int,
+    seed: int,
+) -> tuple[list[GcbpoPreferencePair], list[GcbpoBranchCandidate], dict[str, float]]:
+    if expert_buffer is None:
+        return [], [], {}
+    gcbpo_cfg = _gcbpo_config(cfg)
+    num_envs = int(batch.actions.size(1))
+    n_traj = int(batch.actions.size(2))
+    objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
+    old_policy = _policy_route_old_mean_logprobs(batch)
+    max_instances = int(gcbpo_cfg["max_instances_per_epoch"])
+    env_indices = np.arange(num_envs, dtype=np.int64)
+    if max_instances > 0 and max_instances < num_envs:
+        rng = np.random.default_rng(int(seed) * 1_000_003 + int(epoch))
+        env_indices = np.sort(rng.choice(env_indices, size=max_instances, replace=False))
+    top_q = max(min(float(gcbpo_cfg["top_quantile"]), 1.0), 1e-6)
+    bottom_q = max(min(float(gcbpo_cfg["bottom_quantile"]), 1.0), 1e-6)
+    gap_floor_ratio = max(float(gcbpo_cfg["gap_floor_ratio"]), 0.0)
+    pair_weight_max = max(float(gcbpo_cfg["pair_weight_max"]), 0.0)
+    soft_weight_coef = max(float(gcbpo_cfg["soft_weight_coef"]), 0.0)
+    margin_abs = max(float(gcbpo_cfg["margin_abs"]), 0.0)
+    prefix_lengths = [x for x in gcbpo_cfg["prefix_lengths"] if int(x) > 0]
+    completions = max(1, int(gcbpo_cfg["branch_completions_per_prefix"]))
+    max_steps = int(cfg.get("training", {}).get("rollout_steps", batch.actions.size(0)))
+    max_pairs_per_instance = max(0, int(gcbpo_cfg["branch_pairs_per_instance"]))
+
+    branch_candidates: list[GcbpoBranchCandidate] = []
+    pending_pairs: list[tuple[int, int, float, bool]] = []
+    prefix_valids: list[float] = []
+    prefix_lens_used: list[int] = []
+    branch_success_counts: list[float] = []
+    branch_gap_closes: list[float] = []
+    branch_beats_best = 0
+    branch_beats_top = 0
+    branch_compared = 0
+    strong_pair_count = 0
+    soft_pair_count = 0
+    pair_weights: list[float] = []
+
+    for env_idx in env_indices:
+        env_idx_i = int(env_idx)
+        succ_idx = _successful_obj_indices(objective[env_idx_i], success[env_idx_i])
+        if succ_idx.size < 1:
+            continue
+        instance_id = _env_instance_id(envs[env_idx_i])
+        traj = expert_buffer.trajectory_for_instance(instance_id)
+        instance = _env_instance(envs[env_idx_i])
+        if traj is None or traj.length <= 0 or instance is None:
+            continue
+        ref_obj = float(traj.objective_distance_km)
+        if not np.isfinite(ref_obj) or ref_obj <= 0.0:
+            continue
+        succ_obj = objective[env_idx_i, succ_idx].astype(np.float64)
+        policy_best = float(np.min(succ_obj))
+        policy_top_mean = _top_mean_objective(succ_obj, top_q)
+        order = succ_idx[np.argsort(objective[env_idx_i, succ_idx])]
+        n_bottom = max(1, int(np.ceil(bottom_q * order.size)))
+        bottom = order[-n_bottom:][::-1]
+        gap_den_best = max(policy_best - ref_obj, gap_floor_ratio * max(ref_obj, 1e-8), 1e-8)
+        soft_den = max(policy_top_mean - ref_obj, gap_floor_ratio * max(ref_obj, 1e-8), 1e-8)
+        for prefix_len in prefix_lengths:
+            prefix_len_i = int(prefix_len)
+            if prefix_len_i > traj.length:
+                continue
+            candidates, replay_info = _complete_gcbpo_prefix_candidates(
+                agent,
+                instance,
+                traj.actions[:prefix_len_i],
+                cfg,
+                env_idx=env_idx_i,
+                prefix_len=prefix_len_i,
+                prefix_weight=0.0,
+                completions=completions,
+                max_steps=max_steps,
+                device=device,
+                seed=int(seed) * 1_000_000 + int(epoch) * 10_000 + env_idx_i * 101 + prefix_len_i,
+            )
+            prefix_valids.append(float(replay_info.get("prefix_valid", 0.0)))
+            branch_success_counts.append(float(replay_info.get("branch_success_count", 0.0)))
+            if not candidates:
+                continue
+            best_branch = min(candidates, key=lambda x: x.objective)
+            branch_obj = float(best_branch.objective)
+            strong = bool(branch_obj < policy_best - margin_abs)
+            soft = bool(branch_obj < policy_top_mean - margin_abs)
+            if not strong and not soft:
+                continue
+            branch_compared += 1
+            if strong:
+                branch_beats_best += 1
+            if soft:
+                branch_beats_top += 1
+            gap_close = 0.0
+            if strong:
+                gap_close = float(np.clip((policy_best - branch_obj) / gap_den_best, 0.0, pair_weight_max))
+            else:
+                gap_close = soft_weight_coef * float(np.clip((policy_top_mean - branch_obj) / soft_den, 0.0, pair_weight_max))
+            if gap_close <= 1e-8:
+                continue
+            best_branch.prefix_weight = gap_close if strong else gap_close * 0.5
+            branch_idx = len(branch_candidates)
+            branch_candidates.append(best_branch)
+            prefix_lens_used.append(prefix_len_i)
+            branch_gap_closes.append(gap_close)
+            worse = bottom[objective[env_idx_i, bottom] > branch_obj + margin_abs]
+            if worse.size == 0:
+                worse = succ_idx[objective[env_idx_i, succ_idx] > branch_obj + margin_abs]
+                worse = worse[np.argsort(objective[env_idx_i, worse])[::-1]]
+            for k, neg in enumerate(worse[:max_pairs_per_instance]):
+                gap = float(objective[env_idx_i, int(neg)] - branch_obj)
+                if gap <= 1e-8:
+                    continue
+                scale = gap_den_best if strong else soft_den
+                weight = gap_close * float(np.clip(gap / scale, 0.0, pair_weight_max))
+                if weight <= 1e-8:
+                    continue
+                pending_pairs.append((branch_idx, int(neg), float(weight), bool(strong)))
+                pair_weights.append(float(weight))
+                if strong:
+                    strong_pair_count += 1
+                else:
+                    soft_pair_count += 1
+
+    if branch_candidates:
+        chunk_size = max(1, int(gcbpo_cfg["expert_logprob_chunk_size"]))
+        with torch.no_grad():
+            old_branch = _expert_route_mean_logprobs(agent, branch_candidates, device, chunk_size).detach().float().cpu().numpy()
+        for candidate, old_val in zip(branch_candidates, old_branch):
+            candidate.old_mean_logprob = float(old_val)
+
+    pairs: list[GcbpoPreferencePair] = []
+    for branch_idx, neg_traj, weight, strong in pending_pairs:
+        candidate = branch_candidates[branch_idx]
+        env_idx_i = int(candidate.env_idx)
+        pairs.append(
+            GcbpoPreferencePair(
+                env_idx=env_idx_i,
+                branch_idx=int(branch_idx),
+                neg_traj=int(neg_traj),
+                old_delta=float(candidate.old_mean_logprob - old_policy[env_idx_i, int(neg_traj)]),
+                weight=float(weight),
+                strong=bool(strong),
+            )
+        )
+
+    info = {
+        "gcbpo_branch_candidates": float(len(branch_candidates)),
+        "gcbpo_pref_pairs": float(len(pairs)),
+        "gcbpo_strong_pairs": float(strong_pair_count),
+        "gcbpo_soft_pairs": float(soft_pair_count),
+        "gcbpo_branch_beats_best_rate": float(branch_beats_best / max(branch_compared, 1)),
+        "gcbpo_branch_beats_top_mean_rate": float(branch_beats_top / max(branch_compared, 1)),
+        "gcbpo_branch_gap_close_mean": float(np.mean(branch_gap_closes)) if branch_gap_closes else 0.0,
+        "gcbpo_prefix_valid_rate": float(np.mean(prefix_valids)) if prefix_valids else 0.0,
+        "gcbpo_prefix_len_mean": float(np.mean(prefix_lens_used)) if prefix_lens_used else 0.0,
+        "gcbpo_branch_success_count_mean": float(np.mean(branch_success_counts)) if branch_success_counts else 0.0,
+        "gcbpo_pair_weight_mean": float(np.mean(pair_weights)) if pair_weights else 0.0,
+        "gcbpo_branch_coef": float(gcbpo_cfg["branch_coef"]),
+        "gcbpo_prefix_coef": float(gcbpo_cfg["prefix_coef"]),
+    }
+    return pairs, branch_candidates, info
+
+
+def _compute_gcbpo_preference_loss(
+    agent: Agent,
+    batch,
+    pairs: list[GcbpoPreferencePair],
+    candidates: list[GcbpoBranchCandidate],
+    cfg: dict[str, Any],
+    env_indices: np.ndarray,
+    device: str | torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    gcbpo_cfg = _gcbpo_config(cfg)
+    selected_envs = {int(idx) for idx in np.asarray(env_indices, dtype=np.int64).reshape(-1)}
+    selected_pairs = [pair for pair in pairs if pair.env_idx in selected_envs and pair.weight > 0.0]
+    selected_prefix = [idx for idx, candidate in enumerate(candidates) if candidate.env_idx in selected_envs and candidate.prefix_weight > 0.0]
+    if not selected_pairs and not selected_prefix:
+        zero = torch.zeros((), dtype=torch.float32, device=device, requires_grad=True)
+        return zero, zero, {
+            "gcbpo_pref_loss": 0.0,
+            "gcbpo_prefix_loss": 0.0,
+            "gcbpo_pref_pair_count": 0.0,
+            "gcbpo_strong_pair_count": 0.0,
+            "gcbpo_soft_pair_count": 0.0,
+            "gcbpo_pref_weight_mean": 0.0,
+            "gcbpo_pref_logit_mean": 0.0,
+            "gcbpo_prefix_route_count": 0.0,
+        }
+
+    env_indices = np.asarray(env_indices, dtype=np.int64)
+    env_to_local = {int(env_idx): local_idx for local_idx, env_idx in enumerate(env_indices)}
+    total_steps = int(batch.actions.size(0))
+    n_traj = int(batch.actions.size(2))
+    cached_state = agent.backbone.encode(_slice_obs_by_env(batch.observations[0], env_indices))
+    route_sums = torch.zeros((len(env_indices), n_traj), dtype=batch.old_logprobs.dtype, device=device)
+    route_counts = torch.zeros_like(route_sums)
+    for step in range(total_steps):
+        obs_mb = _slice_obs_by_env(batch.observations[step], env_indices)
+        actions = batch.actions[step, env_indices].long()
+        _, new_logprob, _, _, _ = agent.get_action_and_value_cached(obs_mb, action=actions, state=cached_state)
+        valid = batch.valid[step, env_indices].to(dtype=new_logprob.dtype)
+        route_sums = route_sums + new_logprob * valid
+        route_counts = route_counts + valid
+    policy_mean = route_sums / route_counts.clamp_min(1.0)
+
+    needed_branch_indices = sorted({pair.branch_idx for pair in selected_pairs} | set(selected_prefix))
+    branch_logprob: dict[int, torch.Tensor] = {}
+    if needed_branch_indices:
+        needed_candidates = [candidates[idx] for idx in needed_branch_indices]
+        chunk_size = max(1, int(gcbpo_cfg["expert_logprob_chunk_size"]))
+        branch_mean = _expert_route_mean_logprobs(agent, needed_candidates, device, chunk_size)
+        branch_logprob = {idx: value for idx, value in zip(needed_branch_indices, branch_mean)}
+
+    pos_values: list[torch.Tensor] = []
+    neg_values: list[torch.Tensor] = []
+    old_deltas: list[float] = []
+    weights: list[float] = []
+    strong_count = 0
+    soft_count = 0
+    for pair in selected_pairs:
+        local_idx = env_to_local.get(pair.env_idx)
+        if local_idx is None or pair.neg_traj < 0 or pair.neg_traj >= n_traj:
+            continue
+        if route_counts[local_idx, pair.neg_traj].item() <= 0:
+            continue
+        pos = branch_logprob.get(pair.branch_idx)
+        if pos is None:
+            continue
+        pos_values.append(pos)
+        neg_values.append(policy_mean[local_idx, pair.neg_traj])
+        old_deltas.append(float(pair.old_delta))
+        weights.append(float(pair.weight))
+        if pair.strong:
+            strong_count += 1
+        else:
+            soft_count += 1
+
+    if pos_values:
+        pos_t = torch.stack(pos_values)
+        neg_t = torch.stack(neg_values)
+        old_delta_t = torch.as_tensor(old_deltas, dtype=pos_t.dtype, device=pos_t.device)
+        weight_t = torch.as_tensor(weights, dtype=pos_t.dtype, device=pos_t.device)
+        logits = float(gcbpo_cfg["beta"]) * ((pos_t - neg_t) - old_delta_t.detach())
+        pref_loss = -(weight_t.detach() * F.logsigmoid(logits)).mean()
+        pref_weight_mean = float(weight_t.detach().mean().cpu().item())
+        pref_logit_mean = float(logits.detach().mean().cpu().item())
+    else:
+        pref_loss = route_sums.sum() * 0.0
+        pref_weight_mean = 0.0
+        pref_logit_mean = 0.0
+
+    prefix_values: list[torch.Tensor] = []
+    prefix_weights: list[float] = []
+    for branch_idx in selected_prefix:
+        candidate = candidates[branch_idx]
+        value = branch_logprob.get(branch_idx)
+        if value is None:
+            continue
+        prefix_values.append(value)
+        prefix_weights.append(float(candidate.prefix_weight))
+    if prefix_values:
+        prefix_t = torch.stack(prefix_values)
+        prefix_weight_t = torch.as_tensor(prefix_weights, dtype=prefix_t.dtype, device=prefix_t.device)
+        prefix_loss = -(prefix_weight_t.detach() * prefix_t).mean()
+    else:
+        prefix_loss = route_sums.sum() * 0.0
+
+    return pref_loss, prefix_loss, {
+        "gcbpo_pref_loss": float(pref_loss.detach().cpu().item()),
+        "gcbpo_prefix_loss": float(prefix_loss.detach().cpu().item()),
+        "gcbpo_pref_pair_count": float(len(weights)),
+        "gcbpo_strong_pair_count": float(strong_count),
+        "gcbpo_soft_pair_count": float(soft_count),
+        "gcbpo_pref_weight_mean": pref_weight_mean,
+        "gcbpo_pref_logit_mean": pref_logit_mean,
+        "gcbpo_prefix_route_count": float(len(prefix_values)),
+    }
+
+
 def _load_expert_buffer(cfg: dict[str, Any], seed: int, debug_enabled: bool, debug_file) -> ExpertReplayBuffer | None:
     offline_cfg = cfg.get("offline", {}) or {}
     method = _offline_method(cfg)
@@ -1150,8 +2113,6 @@ def train_from_config(
         n_encode_layers=int(model_cfg.get("n_encode_layers", 2)),
         device=device,
         use_graph_token=bool(model_cfg.get("use_graph_token", True)),
-        use_dynamic_embedding=bool(model_cfg.get("use_dynamic_embedding", False)),
-        use_candidate_dynamic_embedding=model_cfg.get("use_candidate_dynamic_embedding", False),
         use_dynamic_decision_encoder=bool(
             model_cfg.get("use_dynamic_decision_encoder", False)
         ),
@@ -1216,6 +2177,38 @@ def train_from_config(
         "bc_accuracy",
         "bc_entropy",
         "bc_coef",
+        "dapg_demo_gate_mean",
+        "dapg_demo_gate_std",
+        "dapg_memory_better_rate",
+        "dapg_memory_gap_mean",
+        "bafipo_pref_loss",
+        "bafipo_pref_pair_count",
+        "bafipo_policy_pair_count",
+        "bafipo_incumbent_pair_count",
+        "bafipo_quality_gate_mean",
+        "bafipo_memory_gate_mean",
+        "bafipo_spread_gate_mean",
+        "bafipo_incumbent_beats_best_rate",
+        "bafipo_incumbent_beats_mean_rate",
+        "bafipo_pref_weight_mean",
+        "bafipo_pref_logit_mean",
+        "bafipo_pref_coef",
+        "bafipo_minibatches_per_ppo_epoch",
+        "gcbpo_pref_loss",
+        "gcbpo_prefix_loss",
+        "gcbpo_pref_pair_count",
+        "gcbpo_strong_pair_count",
+        "gcbpo_soft_pair_count",
+        "gcbpo_branch_candidates",
+        "gcbpo_branch_beats_best_rate",
+        "gcbpo_branch_beats_top_mean_rate",
+        "gcbpo_branch_gap_close_mean",
+        "gcbpo_prefix_valid_rate",
+        "gcbpo_prefix_len_mean",
+        "gcbpo_pref_weight_mean",
+        "gcbpo_pref_logit_mean",
+        "gcbpo_branch_coef",
+        "gcbpo_prefix_coef",
         "bc_steps",
         "route_bc_loss",
         "route_bc_entropy",
@@ -1335,7 +2328,6 @@ def train_from_config(
             f"accum_grad={gradient_accumulation_steps} "
             f"n_encode_layers={model_cfg.get('n_encode_layers', 2)} "
             f"use_graph_token={model_cfg.get('use_graph_token', True)} "
-            f"use_dynamic_embedding={model_cfg.get('use_dynamic_embedding', False)} "
             f"use_dynamic_decision_encoder={model_cfg.get('use_dynamic_decision_encoder', False)} "
             f"mixed_precision={amp_enabled} "
             f"offline_method={offline_method} use_gae={use_gae} gae_lambda={gae_lambda} "
@@ -1352,13 +2344,15 @@ def train_from_config(
             offline_updates = 0
             bc_info: dict[str, Any] = {}
             sl_info: dict[str, Any] = {}
+            bafipo_info: dict[str, Any] = {}
+            gcbpo_info: dict[str, Any] = {}
             adv_info: dict[str, Any] = {}
             bc_warmup_epochs = int(offline_cfg.get("bc_warmup_epochs", 0))
             bc_updates_per_epoch = int(offline_cfg.get("bc_updates_per_epoch", offline_cfg.get("offline_updates_per_epoch", 1)))
             route_updates_per_epoch = int(offline_cfg.get("route_updates_per_epoch", offline_cfg.get("offline_updates_per_epoch", 1)))
             offline_coef = _offline_coef(offline_cfg, epoch)
             do_bc_warmup = (
-                offline_method in {"bc_ppo", "bc-ppo", "dapg", "bc_dapg", "bc+ppo"}
+                (offline_method in {"bc_ppo", "bc-ppo"} or _is_dapg_method(offline_method) or _is_frro_method(offline_method))
                 and expert_buffer is not None
                 and epoch <= bc_warmup_epochs
             )
@@ -1411,11 +2405,19 @@ def train_from_config(
                 adv_vals = advantages[batch.valid]
                 if adv_vals.numel() > 1:
                     advantages = (advantages - adv_vals.mean()) / (adv_vals.std(unbiased=False) + 1e-8)
+                dapg_enabled = expert_buffer is not None and _is_dapg_method(offline_method)
+                bafipo_enabled = expert_buffer is not None and _is_bafipo_method(offline_method)
+                gcbpo_enabled = expert_buffer is not None and _is_gcbpo_method(offline_method)
+                dapg_demo_gate = 1.0
                 sl_enabled = _is_solution_level_method(offline_method)
                 route_bc_enabled = _is_route_bc_method(offline_method)
                 route_adv_tensor = None
                 route_success_tensor = None
                 frro_expert_candidates: list[FrroExpertCandidate] = []
+                bafipo_pairs: list[BafipoPreferencePair] = []
+                bafipo_incumbents: list[BafipoIncumbentCandidate] = []
+                gcbpo_pairs: list[GcbpoPreferencePair] = []
+                gcbpo_candidates: list[GcbpoBranchCandidate] = []
                 if sl_enabled:
                     route_adv_tensor, route_success_tensor, adv_info = _solution_level_advantage_tensors(
                         batch,
@@ -1447,6 +2449,41 @@ def train_from_config(
                         expert_buffer,
                         device,
                     )
+                    if bafipo_enabled:
+                        bafipo_pairs, bafipo_incumbents, bafipo_prepare_info = _prepare_bafipo_preference_pairs(
+                            agent,
+                            batch,
+                            cfg,
+                            envs,
+                            expert_buffer,
+                            policy_best_objectives,
+                            device,
+                        )
+                        adv_info.update(bafipo_prepare_info)
+                        _update_policy_best_objectives(policy_best_objectives, batch, envs)
+                    elif gcbpo_enabled:
+                        gcbpo_pairs, gcbpo_candidates, gcbpo_prepare_info = _prepare_gcbpo_preference_pairs(
+                            agent,
+                            batch,
+                            cfg,
+                            envs,
+                            expert_buffer,
+                            device,
+                            epoch,
+                            seed,
+                        )
+                        adv_info.update(gcbpo_prepare_info)
+                        _update_policy_best_objectives(policy_best_objectives, batch, envs)
+                    elif dapg_enabled:
+                        dapg_demo_gate, dapg_gate_info = _dapg_demo_gate_from_rollout(
+                            batch,
+                            cfg,
+                            envs,
+                            expert_buffer,
+                            policy_best_objectives,
+                        )
+                        adv_info.update(dapg_gate_info)
+                        _update_policy_best_objectives(policy_best_objectives, batch, envs)
 
                 losses = []
                 num_envs = int(batch.actions.size(1))
@@ -1458,7 +2495,6 @@ def train_from_config(
                 total_steps = int(batch.actions.size(0))
                 chunk_size = ppo_step_chunk_size if ppo_step_chunk_size > 0 else total_steps
                 chunk_size = max(1, min(chunk_size, total_steps))
-                dapg_enabled = expert_buffer is not None and offline_method in {"dapg", "bc_dapg", "bc+ppo"}
                 dapg_adv_scale = 1.0
                 dapg_demo_coef = float(offline_coef)
                 if dapg_enabled:
@@ -1470,12 +2506,31 @@ def train_from_config(
                     if valid_adv.numel() > 0:
                         dapg_adv_scale = max(float(valid_adv.max().detach().cpu().item()), 0.0)
                     dapg_demo_coef = max(dapg_base_coef * (dapg_decay ** dapg_iteration), dapg_min_coef)
-                    dapg_demo_coef *= dapg_adv_scale
+                    dapg_demo_coef *= dapg_adv_scale * float(dapg_demo_gate)
                 dapg_bc_batch_size = int(offline_cfg.get("bc_batch_size", 256))
                 dapg_bc_losses: list[float] = []
                 dapg_bc_accs: list[float] = []
                 dapg_bc_entropies: list[float] = []
                 dapg_bc_steps = 0
+                bafipo_pref_coef = float(_bafipo_config(cfg)["pref_coef"])
+                bafipo_minibatches_per_ppo_epoch = int(offline_cfg.get("bafipo_minibatches_per_ppo_epoch", 0) or 0)
+                bafipo_pref_losses: list[float] = []
+                bafipo_pref_pair_counts: list[float] = []
+                bafipo_policy_pair_counts: list[float] = []
+                bafipo_incumbent_pair_counts: list[float] = []
+                bafipo_pref_weight_means: list[float] = []
+                bafipo_pref_logit_means: list[float] = []
+                gcbpo_cfg = _gcbpo_config(cfg)
+                gcbpo_branch_coef = float(gcbpo_cfg["branch_coef"])
+                gcbpo_prefix_coef = float(gcbpo_cfg["prefix_coef"])
+                gcbpo_pref_losses: list[float] = []
+                gcbpo_prefix_losses: list[float] = []
+                gcbpo_pref_pair_counts: list[float] = []
+                gcbpo_strong_pair_counts: list[float] = []
+                gcbpo_soft_pair_counts: list[float] = []
+                gcbpo_pref_weight_means: list[float] = []
+                gcbpo_pref_logit_means: list[float] = []
+                gcbpo_prefix_route_counts: list[float] = []
                 sl_losses: list[float] = []
                 sl_ratio_means: list[float] = []
                 sl_ratio_stds: list[float] = []
@@ -1491,6 +2546,7 @@ def train_from_config(
                 frro_expert_adv_stds: list[float] = []
                 frro_expert_route_counts: list[float] = []
                 for _ in range(ppo_epochs):
+                    bafipo_minibatches_used_this_ppo_epoch = 0
                     np.random.shuffle(env_order)
                     split_indices = [indices for indices in np.array_split(env_order, minibatches) if indices.size > 0]
                     for group_start in range(0, len(split_indices), gradient_accumulation_steps):
@@ -1562,6 +2618,63 @@ def train_from_config(
                                 frro_expert_adv_means.append(float(expert_info["frro_expert_adv_mean"]))
                                 frro_expert_adv_stds.append(float(expert_info["frro_expert_adv_std"]))
                                 frro_expert_route_counts.append(float(expert_info["frro_expert_num_routes"]))
+                            if (
+                                bafipo_enabled
+                                and bafipo_pairs
+                                and bafipo_pref_coef > 0.0
+                                and (
+                                    bafipo_minibatches_per_ppo_epoch <= 0
+                                    or bafipo_minibatches_used_this_ppo_epoch < bafipo_minibatches_per_ppo_epoch
+                                )
+                            ):
+                                bafipo_minibatches_used_this_ppo_epoch += 1
+                                with _autocast_context(device, amp_enabled):
+                                    pref_loss, pref_info = _compute_bafipo_preference_loss(
+                                        agent,
+                                        batch,
+                                        bafipo_pairs,
+                                        bafipo_incumbents,
+                                        cfg,
+                                        env_indices,
+                                        device,
+                                    )
+                                _backward(bafipo_pref_coef * pref_loss / group_size, scaler, amp_enabled)
+                                if float(pref_info["bafipo_pref_pair_count"]) > 0.0:
+                                    bafipo_pref_losses.append(float(pref_info["bafipo_pref_loss"]))
+                                    bafipo_pref_pair_counts.append(float(pref_info["bafipo_pref_pair_count"]))
+                                    bafipo_policy_pair_counts.append(float(pref_info["bafipo_policy_pair_count"]))
+                                    bafipo_incumbent_pair_counts.append(float(pref_info["bafipo_incumbent_pair_count"]))
+                                    bafipo_pref_weight_means.append(float(pref_info["bafipo_pref_weight_mean"]))
+                                    bafipo_pref_logit_means.append(float(pref_info["bafipo_pref_logit_mean"]))
+                            if (
+                                gcbpo_enabled
+                                and (gcbpo_pairs or gcbpo_candidates)
+                                and (gcbpo_branch_coef > 0.0 or gcbpo_prefix_coef > 0.0)
+                            ):
+                                with _autocast_context(device, amp_enabled):
+                                    gcbpo_pref_loss, gcbpo_prefix_loss, gcbpo_loss_info = _compute_gcbpo_preference_loss(
+                                        agent,
+                                        batch,
+                                        gcbpo_pairs,
+                                        gcbpo_candidates,
+                                        cfg,
+                                        env_indices,
+                                        device,
+                                    )
+                                _backward(
+                                    (gcbpo_branch_coef * gcbpo_pref_loss + gcbpo_prefix_coef * gcbpo_prefix_loss) / group_size,
+                                    scaler,
+                                    amp_enabled,
+                                )
+                                if float(gcbpo_loss_info["gcbpo_pref_pair_count"]) > 0.0:
+                                    gcbpo_pref_losses.append(float(gcbpo_loss_info["gcbpo_pref_loss"]))
+                                    gcbpo_prefix_losses.append(float(gcbpo_loss_info["gcbpo_prefix_loss"]))
+                                    gcbpo_pref_pair_counts.append(float(gcbpo_loss_info["gcbpo_pref_pair_count"]))
+                                    gcbpo_strong_pair_counts.append(float(gcbpo_loss_info["gcbpo_strong_pair_count"]))
+                                    gcbpo_soft_pair_counts.append(float(gcbpo_loss_info["gcbpo_soft_pair_count"]))
+                                    gcbpo_pref_weight_means.append(float(gcbpo_loss_info["gcbpo_pref_weight_mean"]))
+                                    gcbpo_pref_logit_means.append(float(gcbpo_loss_info["gcbpo_pref_logit_mean"]))
+                                    gcbpo_prefix_route_counts.append(float(gcbpo_loss_info["gcbpo_prefix_route_count"]))
                             group_policy += weighted_policy / group_size
                             group_value += weighted_value / group_size
                             group_entropy += weighted_entropy / group_size
@@ -1589,6 +2702,40 @@ def train_from_config(
                         "bc_steps": int(dapg_bc_steps),
                         "bc_coef": float(dapg_demo_coef),
                         "offline_updates": int(offline_updates),
+                    }
+                if bafipo_enabled:
+                    bafipo_info = {
+                        "bafipo_pref_loss": float(np.mean(bafipo_pref_losses)) if bafipo_pref_losses else 0.0,
+                        "bafipo_pref_pair_count": int(np.sum(bafipo_pref_pair_counts)) if bafipo_pref_pair_counts else 0,
+                        "bafipo_policy_pair_count": int(np.sum(bafipo_policy_pair_counts)) if bafipo_policy_pair_counts else 0,
+                        "bafipo_incumbent_pair_count": int(np.sum(bafipo_incumbent_pair_counts)) if bafipo_incumbent_pair_counts else 0,
+                        "bafipo_quality_gate_mean": adv_info.get("bafipo_quality_gate_mean", 0.0),
+                        "bafipo_memory_gate_mean": adv_info.get("bafipo_memory_gate_mean", 0.0),
+                        "bafipo_spread_gate_mean": adv_info.get("bafipo_spread_gate_mean", 0.0),
+                        "bafipo_incumbent_beats_best_rate": adv_info.get("bafipo_incumbent_beats_best_rate", 0.0),
+                        "bafipo_incumbent_beats_mean_rate": adv_info.get("bafipo_incumbent_beats_mean_rate", 0.0),
+                        "bafipo_pref_weight_mean": float(np.mean(bafipo_pref_weight_means)) if bafipo_pref_weight_means else adv_info.get("bafipo_pair_weight_mean", 0.0),
+                        "bafipo_pref_logit_mean": float(np.mean(bafipo_pref_logit_means)) if bafipo_pref_logit_means else 0.0,
+                        "bafipo_pref_coef": float(bafipo_pref_coef),
+                        "bafipo_minibatches_per_ppo_epoch": int(bafipo_minibatches_per_ppo_epoch),
+                    }
+                if gcbpo_enabled:
+                    gcbpo_info = {
+                        "gcbpo_pref_loss": float(np.mean(gcbpo_pref_losses)) if gcbpo_pref_losses else 0.0,
+                        "gcbpo_prefix_loss": float(np.mean(gcbpo_prefix_losses)) if gcbpo_prefix_losses else 0.0,
+                        "gcbpo_pref_pair_count": int(np.sum(gcbpo_pref_pair_counts)) if gcbpo_pref_pair_counts else 0,
+                        "gcbpo_strong_pair_count": int(np.sum(gcbpo_strong_pair_counts)) if gcbpo_strong_pair_counts else 0,
+                        "gcbpo_soft_pair_count": int(np.sum(gcbpo_soft_pair_counts)) if gcbpo_soft_pair_counts else 0,
+                        "gcbpo_branch_candidates": int(adv_info.get("gcbpo_branch_candidates", 0)),
+                        "gcbpo_branch_beats_best_rate": adv_info.get("gcbpo_branch_beats_best_rate", 0.0),
+                        "gcbpo_branch_beats_top_mean_rate": adv_info.get("gcbpo_branch_beats_top_mean_rate", 0.0),
+                        "gcbpo_branch_gap_close_mean": adv_info.get("gcbpo_branch_gap_close_mean", 0.0),
+                        "gcbpo_prefix_valid_rate": adv_info.get("gcbpo_prefix_valid_rate", 0.0),
+                        "gcbpo_prefix_len_mean": adv_info.get("gcbpo_prefix_len_mean", 0.0),
+                        "gcbpo_pref_weight_mean": float(np.mean(gcbpo_pref_weight_means)) if gcbpo_pref_weight_means else adv_info.get("gcbpo_pair_weight_mean", 0.0),
+                        "gcbpo_pref_logit_mean": float(np.mean(gcbpo_pref_logit_means)) if gcbpo_pref_logit_means else 0.0,
+                        "gcbpo_branch_coef": float(gcbpo_branch_coef),
+                        "gcbpo_prefix_coef": float(gcbpo_prefix_coef),
                     }
                 if sl_enabled:
                     sl_info = {
@@ -1675,6 +2822,17 @@ def train_from_config(
                     f"{_format_float(adv_info.get('ref_adv_std', 0.0))} "
                     f"ref_gap={_format_float(adv_info.get('ref_base_gap_ratio_mean', 0.0))} "
                     f"ref_mem_gate={_format_float(adv_info.get('ref_memory_gate_mean', 0.0))} "
+                    f"dapg_gate={_format_float(adv_info.get('dapg_demo_gate_mean', 1.0))} "
+                    f"dapg_mem_better={_format_float(adv_info.get('dapg_memory_better_rate', 0.0))} "
+                    f"bafipo={_format_float(bafipo_info.get('bafipo_pref_loss', 0.0))}/"
+                    f"{_format_float(bafipo_info.get('bafipo_pref_pair_count', 0.0))} "
+                    f"bafipo_gates={_format_float(bafipo_info.get('bafipo_quality_gate_mean', 0.0))}/"
+                    f"{_format_float(bafipo_info.get('bafipo_memory_gate_mean', 0.0))}/"
+                    f"{_format_float(bafipo_info.get('bafipo_spread_gate_mean', 0.0))} "
+                    f"gcbpo={_format_float(gcbpo_info.get('gcbpo_pref_loss', 0.0))}/"
+                    f"{_format_float(gcbpo_info.get('gcbpo_pref_pair_count', 0.0))} "
+                    f"gcbpo_branch={_format_float(gcbpo_info.get('gcbpo_branch_beats_best_rate', 0.0))}/"
+                    f"{_format_float(gcbpo_info.get('gcbpo_branch_gap_close_mean', 0.0))} "
                     f"frro={_format_float(adv_info.get('frro_adv_mean', 0.0))} "
                     f"frro_gate={_format_float(adv_info.get('frro_gate_mean', 0.0))} "
                     f"frro_falsified={_format_float(adv_info.get('frro_falsified_rate', 0.0))} "
@@ -1748,6 +2906,38 @@ def train_from_config(
                     "bc_accuracy": bc_info.get("bc_accuracy", ""),
                     "bc_entropy": bc_info.get("bc_entropy", ""),
                     "bc_coef": bc_info.get("bc_coef", ""),
+                    "dapg_demo_gate_mean": adv_info.get("dapg_demo_gate_mean", ""),
+                    "dapg_demo_gate_std": adv_info.get("dapg_demo_gate_std", ""),
+                    "dapg_memory_better_rate": adv_info.get("dapg_memory_better_rate", ""),
+                    "dapg_memory_gap_mean": adv_info.get("dapg_memory_gap_mean", ""),
+                    "bafipo_pref_loss": bafipo_info.get("bafipo_pref_loss", ""),
+                    "bafipo_pref_pair_count": bafipo_info.get("bafipo_pref_pair_count", ""),
+                    "bafipo_policy_pair_count": bafipo_info.get("bafipo_policy_pair_count", ""),
+                    "bafipo_incumbent_pair_count": bafipo_info.get("bafipo_incumbent_pair_count", ""),
+                    "bafipo_quality_gate_mean": bafipo_info.get("bafipo_quality_gate_mean", ""),
+                    "bafipo_memory_gate_mean": bafipo_info.get("bafipo_memory_gate_mean", ""),
+                    "bafipo_spread_gate_mean": bafipo_info.get("bafipo_spread_gate_mean", ""),
+                    "bafipo_incumbent_beats_best_rate": bafipo_info.get("bafipo_incumbent_beats_best_rate", ""),
+                    "bafipo_incumbent_beats_mean_rate": bafipo_info.get("bafipo_incumbent_beats_mean_rate", ""),
+                    "bafipo_pref_weight_mean": bafipo_info.get("bafipo_pref_weight_mean", ""),
+                    "bafipo_pref_logit_mean": bafipo_info.get("bafipo_pref_logit_mean", ""),
+                    "bafipo_pref_coef": bafipo_info.get("bafipo_pref_coef", ""),
+                    "bafipo_minibatches_per_ppo_epoch": bafipo_info.get("bafipo_minibatches_per_ppo_epoch", ""),
+                    "gcbpo_pref_loss": gcbpo_info.get("gcbpo_pref_loss", ""),
+                    "gcbpo_prefix_loss": gcbpo_info.get("gcbpo_prefix_loss", ""),
+                    "gcbpo_pref_pair_count": gcbpo_info.get("gcbpo_pref_pair_count", ""),
+                    "gcbpo_strong_pair_count": gcbpo_info.get("gcbpo_strong_pair_count", ""),
+                    "gcbpo_soft_pair_count": gcbpo_info.get("gcbpo_soft_pair_count", ""),
+                    "gcbpo_branch_candidates": gcbpo_info.get("gcbpo_branch_candidates", ""),
+                    "gcbpo_branch_beats_best_rate": gcbpo_info.get("gcbpo_branch_beats_best_rate", ""),
+                    "gcbpo_branch_beats_top_mean_rate": gcbpo_info.get("gcbpo_branch_beats_top_mean_rate", ""),
+                    "gcbpo_branch_gap_close_mean": gcbpo_info.get("gcbpo_branch_gap_close_mean", ""),
+                    "gcbpo_prefix_valid_rate": gcbpo_info.get("gcbpo_prefix_valid_rate", ""),
+                    "gcbpo_prefix_len_mean": gcbpo_info.get("gcbpo_prefix_len_mean", ""),
+                    "gcbpo_pref_weight_mean": gcbpo_info.get("gcbpo_pref_weight_mean", ""),
+                    "gcbpo_pref_logit_mean": gcbpo_info.get("gcbpo_pref_logit_mean", ""),
+                    "gcbpo_branch_coef": gcbpo_info.get("gcbpo_branch_coef", ""),
+                    "gcbpo_prefix_coef": gcbpo_info.get("gcbpo_prefix_coef", ""),
                     "bc_steps": bc_info.get("bc_steps", ""),
                     "route_bc_loss": bc_info.get("route_bc_loss", ""),
                     "route_bc_entropy": bc_info.get("route_bc_entropy", ""),

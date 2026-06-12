@@ -31,8 +31,6 @@ model:
   tanh_clipping: 15.0
   n_encode_layers: 2
   use_graph_token: true
-  use_dynamic_embedding: false
-  use_candidate_dynamic_embedding: false
 training:
   online_training: false
   epochs: 1000

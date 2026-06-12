@@ -130,7 +130,7 @@ conda run -n maojie python -m offline2online.train \
 Expected behavior:
 
 - The offline archive loads and expert routes replay successfully.
-- `use_dynamic_embedding=False` appears in the debug log.
+- DDE and mixed-precision settings appear in the debug log.
 - `mixed_precision=False` on CPU.
 - Train, validation, logging, and checkpoint writing complete.
 

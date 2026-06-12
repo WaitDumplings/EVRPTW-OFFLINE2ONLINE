@@ -27,7 +27,17 @@ def prepare_observation_batch(obs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in obs.items():
         arr = np.asarray(value)
-        if key in {"cus_loc", "rs_loc", "time_window", "action_mask"}:
+        if key in {
+            "cus_loc",
+            "rs_loc",
+            "time_window",
+            "action_mask",
+            "node_visit_count",
+            "customer_visited",
+            "cs_visited_current_route",
+            "route_membership_current",
+            "route_order_rank",
+        }:
             out[key] = arr[None, ...] if arr.ndim == 2 else value
         elif key == "depot_loc":
             out[key] = arr[None, ...] if arr.ndim == 2 else value
@@ -49,6 +59,8 @@ def prepare_observation_batch(obs: dict[str, Any]) -> dict[str, Any]:
             "remain_feasible_customers_raio",
             "route_served_customers_ratio",
             "rs_streak_ratio",
+            "current_route_step_count",
+            "current_route_customer_count",
         }:
             out[key] = arr[None, ...] if arr.ndim == 2 else value
         elif key in {"battery_capacity", "loading_capacity"}:
@@ -127,7 +139,7 @@ class StateWrapper:
 
 
 class Backbone(nn.Module):
-    """Ablation TERRAN-style backbone with graph token and dynamic embeddings."""
+    """Ablation TERRAN-style backbone with graph token and optional DDE."""
 
     def __init__(
         self,
@@ -138,8 +150,6 @@ class Backbone(nn.Module):
         n_heads: int = 16,
         device: str | torch.device = "cpu",
         use_graph_token: bool = True,
-        use_dynamic_embedding: bool = False,
-        use_candidate_dynamic_embedding: bool | None = None,
         use_dynamic_decision_encoder: bool = False,
         dynamic_decision_heads: int = 4,
     ):
@@ -147,10 +157,6 @@ class Backbone(nn.Module):
         del use_graph_token  # graph token is intrinsic to the migrated graph encoder.
         self.device = device
         self.problem = Problem(problem_name)
-        if use_candidate_dynamic_embedding is None:
-            use_candidate_dynamic_embedding = use_dynamic_embedding
-        self.use_candidate_dynamic_embedding = bool(use_candidate_dynamic_embedding)
-
         self.embedding = AutoEmbedding(self.problem.NAME, {"embedding_dim": embedding_dim})
         self.encoder = GraphAttentionEncoder(
             n_heads=n_heads,
@@ -163,7 +169,6 @@ class Backbone(nn.Module):
             n_heads=n_heads,
             problem=self.problem,
             tanh_clipping=tanh_clipping,
-            use_candidate_dynamic_embedding=self.use_candidate_dynamic_embedding,
             use_dynamic_decision_encoder=use_dynamic_decision_encoder,
             dynamic_decision_heads=dynamic_decision_heads,
         )
@@ -287,8 +292,6 @@ class Agent(nn.Module):
         device: str | torch.device = "cpu",
         name: str = "evrptw",
         use_graph_token: bool = True,
-        use_dynamic_embedding: bool = False,
-        use_candidate_dynamic_embedding: bool | None = None,
         use_dynamic_decision_encoder: bool = False,
         dynamic_decision_heads: int = 4,
     ):
@@ -300,8 +303,6 @@ class Agent(nn.Module):
             n_encode_layers=n_encode_layers,
             problem_name=name,
             use_graph_token=use_graph_token,
-            use_dynamic_embedding=use_dynamic_embedding,
-            use_candidate_dynamic_embedding=use_candidate_dynamic_embedding,
             use_dynamic_decision_encoder=use_dynamic_decision_encoder,
             dynamic_decision_heads=dynamic_decision_heads,
         )

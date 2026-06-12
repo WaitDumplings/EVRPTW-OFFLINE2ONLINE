@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-async-instance-prefetch", action="store_true")
     parser.add_argument("--async-instance-workers", type=int, default=None)
     parser.add_argument("--async-instance-queue-batches", type=int, default=None)
-    parser.add_argument("--offline-method", type=str, default=None, choices=["ppo", "bc_ppo", "dapg", "route_bc_ppo", "sl_ppo", "frro"])
+    parser.add_argument("--offline-method", type=str, default=None, choices=["ppo", "bc_ppo", "dapg", "gadapg", "ga_dapg", "group_dapg", "route_bc_ppo", "sl_ppo", "frro", "bafipo", "ba_fipo", "gcbpo", "gcbpo_branch", "gcbpo_prefix"])
     parser.add_argument("--expert-solution-path", type=str, default=None)
     parser.add_argument("--expert-dataset-path", type=str, default=None)
     parser.add_argument("--expert-limit", type=int, default=None)
@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frro-falsification-margin", type=float, default=None)
     parser.add_argument("--frro-falsification-eta", type=float, default=None)
     parser.add_argument("--frro-expert-candidate-weight", type=float, default=None)
+    parser.add_argument("--bafipo-pref-coef", type=float, default=None)
+    parser.add_argument("--bafipo-beta", type=float, default=None)
+    parser.add_argument("--bafipo-policy-pairs-per-instance", type=int, default=None)
+    parser.add_argument("--bafipo-incumbent-pairs-per-instance", type=int, default=None)
+    parser.add_argument("--bafipo-minibatches-per-ppo-epoch", type=int, default=None)
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--no-mixed-precision", action="store_true")
     parser.add_argument("--eval-interval", type=int, default=None)
@@ -189,6 +194,16 @@ def main() -> None:
         overrides["advantage"]["frro_falsification_eta"] = args.frro_falsification_eta
     if args.frro_expert_candidate_weight is not None:
         overrides["advantage"]["frro_expert_candidate_weight"] = args.frro_expert_candidate_weight
+    if args.bafipo_pref_coef is not None:
+        overrides["offline"]["bafipo_pref_coef"] = args.bafipo_pref_coef
+    if args.bafipo_beta is not None:
+        overrides["offline"]["bafipo_beta"] = args.bafipo_beta
+    if args.bafipo_policy_pairs_per_instance is not None:
+        overrides["offline"]["bafipo_policy_pairs_per_instance"] = args.bafipo_policy_pairs_per_instance
+    if args.bafipo_incumbent_pairs_per_instance is not None:
+        overrides["offline"]["bafipo_incumbent_pairs_per_instance"] = args.bafipo_incumbent_pairs_per_instance
+    if args.bafipo_minibatches_per_ppo_epoch is not None:
+        overrides["offline"]["bafipo_minibatches_per_ppo_epoch"] = args.bafipo_minibatches_per_ppo_epoch
     if args.eval_interval is not None:
         overrides["evaluation"]["eval_interval"] = args.eval_interval
     if args.eval_path is not None:
