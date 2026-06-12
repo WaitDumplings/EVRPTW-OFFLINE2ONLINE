@@ -266,21 +266,24 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, use_decomposed_critic: bool = False):
         super().__init__()
-        self.mlp = nn.Sequential(
+        self.use_decomposed_critic = bool(use_decomposed_critic)
+        self.trunk = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size // 2),
             nn.SiLU(),
-            nn.Linear(hidden_size // 2, 1),
         )
-        for layer in self.mlp:
+        out_dim = 3 if self.use_decomposed_critic else 1
+        self.head = nn.Linear(hidden_size // 2, out_dim)
+        for layer in self.trunk:
             orthogonal_init(layer, gain=0.01)
+        orthogonal_init(self.head, gain=0.01)
 
     def forward(self, backbone_output):
-        return self.mlp(backbone_output[1])
+        return self.head(self.trunk(backbone_output[1]))
 
 
 class Agent(nn.Module):
@@ -294,6 +297,7 @@ class Agent(nn.Module):
         use_graph_token: bool = True,
         use_dynamic_decision_encoder: bool = False,
         dynamic_decision_heads: int = 4,
+        use_decomposed_critic: bool = False,
     ):
         super().__init__()
         self.backbone = Backbone(
@@ -307,7 +311,7 @@ class Agent(nn.Module):
             dynamic_decision_heads=dynamic_decision_heads,
         )
         self.actor = Actor()
-        self.critic = Critic(hidden_size=embedding_dim)
+        self.critic = Critic(hidden_size=embedding_dim, use_decomposed_critic=use_decomposed_critic)
 
     def forward(self, x, use_mask: bool = False, return_logits: bool = True):
         backbone_output = self.backbone(x, use_mask=use_mask)

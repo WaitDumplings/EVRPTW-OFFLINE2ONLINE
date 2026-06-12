@@ -911,20 +911,288 @@ def _dapg_demo_gate_from_rollout(
     }
 
 
-def _compute_gae_returns(batch, gamma: float, gae_lambda: float) -> tuple[torch.Tensor, torch.Tensor]:
-    advantages = torch.zeros_like(batch.rewards)
-    last_gae = torch.zeros_like(batch.rewards[0])
-    for step in reversed(range(batch.rewards.size(0))):
-        if step == batch.rewards.size(0) - 1:
-            next_value = torch.zeros_like(batch.values[step])
+def _to_scalar_values(values: torch.Tensor) -> torch.Tensor:
+    if values.dim() >= 1 and values.size(-1) == 1:
+        return values.squeeze(-1)
+    return values
+
+
+def _value_head(values: torch.Tensor, head_idx: int) -> torch.Tensor:
+    values = _to_scalar_values(values)
+    if values.dim() >= 4 and values.size(-1) >= 3:
+        return values[..., head_idx]
+    return values
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(device=values.device, dtype=values.dtype)
+    denom = mask.sum().clamp_min(1.0)
+    return (values * mask).sum() / denom
+
+
+def _compute_gae_from_rewards(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    dones: torch.Tensor,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    values = _to_scalar_values(values)
+    advantages = torch.zeros_like(rewards)
+    last_gae = torch.zeros_like(rewards[0])
+    for step in reversed(range(rewards.size(0))):
+        if step == rewards.size(0) - 1:
+            next_value = torch.zeros_like(values[step])
         else:
-            next_value = batch.values[step + 1]
-        next_nonterminal = (~batch.dones[step]).float()
-        delta = batch.rewards[step] + float(gamma) * next_value * next_nonterminal - batch.values[step]
+            next_value = values[step + 1]
+        next_nonterminal = (~dones[step]).float()
+        delta = rewards[step] + float(gamma) * next_value * next_nonterminal - values[step]
         last_gae = delta + float(gamma) * float(gae_lambda) * next_nonterminal * last_gae
         advantages[step] = last_gae
-    returns = advantages + batch.values
+    returns = advantages + values
     return returns, advantages
+
+
+def _compute_discounted_returns(rewards: torch.Tensor, dones: torch.Tensor, gamma: float) -> torch.Tensor:
+    returns = torch.zeros_like(rewards)
+    next_return = torch.zeros_like(rewards[0])
+    for step in reversed(range(rewards.size(0))):
+        next_nonterminal = (~dones[step]).float()
+        next_return = rewards[step] + float(gamma) * next_return * next_nonterminal
+        returns[step] = next_return
+    return returns
+
+
+def _compute_gae_returns(batch, gamma: float, gae_lambda: float) -> tuple[torch.Tensor, torch.Tensor]:
+    return _compute_gae_from_rewards(batch.rewards, _value_head(batch.values, 0), batch.dones, gamma, gae_lambda)
+
+
+def _normalize_valid(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    valid_values = values[valid]
+    if valid_values.numel() <= 1:
+        return values
+    return (values - valid_values.mean()) / (valid_values.std(unbiased=False) + 1e-8)
+
+
+def _decomposed_critic_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    train_cfg = cfg.get("training", {}) or {}
+    critic_cfg = cfg.get("critic", {}) or {}
+    out = dict(critic_cfg)
+    for key in (
+        "use_decomposed_critic",
+        "advantage_mode",
+        "value_coef_total",
+        "value_coef_boundary",
+        "value_coef_internal",
+        "consistency_coef",
+        "balanced_adv_weight_boundary",
+        "balanced_adv_weight_internal",
+    ):
+        if key in train_cfg and key not in out:
+            out[key] = train_cfg[key]
+    out.setdefault("use_decomposed_critic", True)
+    out.setdefault("advantage_mode", "total")
+    out.setdefault("value_coef_total", 1.0)
+    out.setdefault("value_coef_boundary", 0.5)
+    out.setdefault("value_coef_internal", 0.5)
+    out.setdefault("consistency_coef", 0.1)
+    out.setdefault("balanced_adv_weight_boundary", 0.3)
+    out.setdefault("balanced_adv_weight_internal", 0.7)
+    return out
+
+
+def _decompose_distance_rewards(batch) -> dict[str, torch.Tensor]:
+    rewards = batch.rewards
+    boundary = torch.zeros_like(rewards)
+    internal = torch.zeros_like(rewards)
+    for step, obs in enumerate(batch.observations[: rewards.size(0)]):
+        last_node = torch.as_tensor(obs["last_node_idx"], device=rewards.device, dtype=batch.actions.dtype)
+        action = batch.actions[step].to(device=rewards.device)
+        boundary_mask = (last_node == 0) | (action == 0)
+        boundary[step] = torch.where(boundary_mask, rewards[step], torch.zeros_like(rewards[step]))
+        internal[step] = torch.where(boundary_mask, torch.zeros_like(rewards[step]), rewards[step])
+    return {"total": rewards, "boundary": boundary, "internal": internal}
+
+
+def _explained_variance(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> float:
+    pred_v = pred[valid].detach()
+    target_v = target[valid].detach()
+    if target_v.numel() <= 1:
+        return float("nan")
+    var_y = torch.var(target_v, unbiased=False)
+    if float(var_y.detach().cpu().item()) <= 1e-12:
+        return float("nan")
+    ev = 1.0 - torch.var(target_v - pred_v, unbiased=False) / (var_y + 1e-8)
+    return float(ev.detach().cpu().item())
+
+
+def _stats(values: torch.Tensor, valid: torch.Tensor) -> tuple[float, float]:
+    vals = values[valid].detach()
+    if vals.numel() == 0:
+        return 0.0, 0.0
+    return float(vals.mean().cpu().item()), float(vals.std(unbiased=False).cpu().item())
+
+
+def _compute_decomposed_returns_advantages(
+    batch,
+    gamma: float,
+    gae_lambda: float,
+    use_gae: bool,
+    cfg: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, dict[str, float]]:
+    rewards = _decompose_distance_rewards(batch)
+    values = {
+        "total": _value_head(batch.values, 0),
+        "boundary": _value_head(batch.values, 1),
+        "internal": _value_head(batch.values, 2),
+    }
+    returns: dict[str, torch.Tensor] = {}
+    advantages: dict[str, torch.Tensor] = {}
+    for name in ("total", "boundary", "internal"):
+        if use_gae:
+            ret, adv = _compute_gae_from_rewards(rewards[name], values[name], batch.dones, gamma, gae_lambda)
+        else:
+            ret = _compute_discounted_returns(rewards[name], batch.dones, gamma)
+            adv = ret - values[name]
+        returns[name] = ret
+        advantages[name] = adv
+
+    critic_cfg = _decomposed_critic_config(cfg)
+    mode = str(critic_cfg.get("advantage_mode", "total")).strip().lower()
+    if mode == "exact_decomp":
+        actor_adv = advantages["boundary"] + advantages["internal"]
+        actor_adv = _normalize_valid(actor_adv, batch.valid)
+    elif mode == "balanced_decomp":
+        boundary_adv = _normalize_valid(advantages["boundary"], batch.valid)
+        internal_adv = _normalize_valid(advantages["internal"], batch.valid)
+        actor_adv = (
+            float(critic_cfg.get("balanced_adv_weight_boundary", 0.3)) * boundary_adv
+            + float(critic_cfg.get("balanced_adv_weight_internal", 0.7)) * internal_adv
+        )
+        actor_adv = _normalize_valid(actor_adv, batch.valid)
+    else:
+        actor_adv = _normalize_valid(advantages["total"], batch.valid)
+
+    info: dict[str, float] = {}
+    for name in ("total", "boundary", "internal"):
+        mean, std = _stats(advantages[name], batch.valid)
+        info[f"adv_{name}_mean"] = mean
+        info[f"adv_{name}_std"] = std
+        ret_mean, _ = _stats(returns[name], batch.valid)
+        info[f"return_{name}_mean"] = ret_mean
+    actor_mean, actor_std = _stats(actor_adv, batch.valid)
+    info["adv_actor_mean"] = actor_mean
+    info["adv_actor_std"] = actor_std
+    boundary_dist = -rewards["boundary"]
+    internal_dist = -rewards["internal"]
+    boundary_sum = float(boundary_dist[batch.valid].sum().detach().cpu().item()) if batch.valid.any() else 0.0
+    internal_sum = float(internal_dist[batch.valid].sum().detach().cpu().item()) if batch.valid.any() else 0.0
+    denom = max(boundary_sum + internal_sum, 1e-8)
+    info["boundary_distance_mean"] = _stats(boundary_dist, batch.valid)[0]
+    info["internal_distance_mean"] = _stats(internal_dist, batch.valid)[0]
+    info["boundary_share"] = boundary_sum / denom
+    info["internal_share"] = internal_sum / denom
+    info["advantage_mode"] = mode
+    return returns, advantages, actor_adv, info
+
+
+def _evaluate_policy_loss_decomposed(
+    agent,
+    batch,
+    returns: dict[str, torch.Tensor],
+    advantages_actor: torch.Tensor,
+    cfg: dict[str, Any],
+    device,
+    env_indices: np.ndarray | None = None,
+    step_start: int = 0,
+    step_end: int | None = None,
+):
+    del device
+    train_cfg = cfg["training"]
+    critic_cfg = _decomposed_critic_config(cfg)
+    clip_coef = float(train_cfg.get("clip_coef", 0.2))
+    vf_coef = float(train_cfg.get("vf_coef", 0.5))
+    ent_coef = float(train_cfg.get("ent_coef", 0.01))
+    value_coef_total = float(critic_cfg.get("value_coef_total", 1.0))
+    value_coef_boundary = float(critic_cfg.get("value_coef_boundary", 0.5))
+    value_coef_internal = float(critic_cfg.get("value_coef_internal", 0.5))
+    consistency_coef = float(critic_cfg.get("consistency_coef", 0.1))
+    if env_indices is None:
+        env_indices = np.arange(batch.actions.size(1), dtype=np.int64)
+    else:
+        env_indices = np.asarray(env_indices, dtype=np.int64)
+    if step_end is None:
+        step_end = len(batch.observations)
+    step_start = max(0, int(step_start))
+    step_end = min(len(batch.observations), int(step_end))
+    if step_start >= step_end:
+        raise ValueError(f"empty PPO step range: [{step_start}, {step_end})")
+
+    cached_state = agent.backbone.encode(_slice_obs_by_env(batch.observations[0], env_indices))
+    policy_losses = []
+    value_total_losses = []
+    value_boundary_losses = []
+    value_internal_losses = []
+    consistency_losses = []
+    entropy_losses = []
+    for step in range(step_start, step_end):
+        obs_mb = _slice_obs_by_env(batch.observations[step], env_indices)
+        actions = batch.actions[step, env_indices].long()
+        old_logprob = batch.old_logprobs[step, env_indices]
+        _, new_logprob, entropy, value, _ = agent.get_action_and_value_cached(
+            obs_mb,
+            action=actions,
+            state=cached_state,
+        )
+        value = _to_scalar_values(value)
+        if value.dim() < 3 or value.size(-1) < 3:
+            raise ValueError("decomposed critic requires value tensor with three heads")
+        value_total = value[..., 0]
+        value_boundary = value[..., 1]
+        value_internal = value[..., 2]
+        ratio = torch.exp(new_logprob - old_logprob)
+        adv = advantages_actor[step, env_indices]
+        unclipped = ratio * adv
+        clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv
+        valid = batch.valid[step, env_indices]
+        policy_losses.append(-_masked_mean(torch.minimum(unclipped, clipped), valid))
+        value_total_losses.append(_masked_mean(F.mse_loss(value_total, returns["total"][step, env_indices], reduction="none"), valid))
+        value_boundary_losses.append(_masked_mean(F.mse_loss(value_boundary, returns["boundary"][step, env_indices], reduction="none"), valid))
+        value_internal_losses.append(_masked_mean(F.mse_loss(value_internal, returns["internal"][step, env_indices], reduction="none"), valid))
+        consistency_losses.append(_masked_mean((value_total - value_boundary - value_internal).pow(2), valid))
+        entropy_losses.append(_masked_mean(entropy, valid))
+    policy_loss = torch.stack(policy_losses).mean()
+    value_loss_total = torch.stack(value_total_losses).mean()
+    value_loss_boundary = torch.stack(value_boundary_losses).mean()
+    value_loss_internal = torch.stack(value_internal_losses).mean()
+    value_consistency_loss = torch.stack(consistency_losses).mean()
+    entropy_loss = torch.stack(entropy_losses).mean()
+    value_loss = (
+        value_coef_total * value_loss_total
+        + value_coef_boundary * value_loss_boundary
+        + value_coef_internal * value_loss_internal
+        + consistency_coef * value_consistency_loss
+    )
+    total = policy_loss + vf_coef * value_loss - ent_coef * entropy_loss
+    loss_info = {
+        "value_loss_total": float(value_loss_total.detach().cpu().item()),
+        "value_loss_boundary": float(value_loss_boundary.detach().cpu().item()),
+        "value_loss_internal": float(value_loss_internal.detach().cpu().item()),
+        "value_consistency_loss": float(value_consistency_loss.detach().cpu().item()),
+    }
+    return total, policy_loss.detach(), value_loss.detach(), entropy_loss.detach(), loss_info
+
+
+def _decomposed_value_diagnostics(batch, returns: dict[str, torch.Tensor]) -> dict[str, float]:
+    values = {
+        "total": _value_head(batch.values, 0),
+        "boundary": _value_head(batch.values, 1),
+        "internal": _value_head(batch.values, 2),
+    }
+    return {
+        f"explained_variance_{name}": _explained_variance(values[name], returns[name], batch.valid)
+        for name in ("total", "boundary", "internal")
+    }
 
 
 def _apply_auxiliary_advantages(
@@ -2098,6 +2366,8 @@ def train_from_config(
     offline_cfg = cfg.get("offline", {}) or {}
     offline_method = _offline_method(cfg)
     model_cfg = cfg.get("model", {})
+    critic_cfg = _decomposed_critic_config(cfg)
+    use_decomposed_critic = bool(model_cfg.get("use_decomposed_critic", critic_cfg.get("use_decomposed_critic", True)))
     cfg.setdefault("env", {})["use_fast_env"] = True
     cfg["env"].setdefault("info_level", "light")
     run_name = str(cfg.get("run_name", "O2O_TERRAN_FULL"))
@@ -2117,6 +2387,7 @@ def train_from_config(
             model_cfg.get("use_dynamic_decision_encoder", False)
         ),
         dynamic_decision_heads=int(model_cfg.get("dynamic_decision_heads", 4)),
+        use_decomposed_critic=use_decomposed_critic,
     ).to(device)
     optimizer = torch.optim.AdamW(
         agent.parameters(),
@@ -2162,6 +2433,29 @@ def train_from_config(
         "policy_loss",
         "value_loss",
         "entropy",
+        "value_loss_total",
+        "value_loss_boundary",
+        "value_loss_internal",
+        "value_consistency_loss",
+        "explained_variance_total",
+        "explained_variance_boundary",
+        "explained_variance_internal",
+        "return_total_mean",
+        "return_boundary_mean",
+        "return_internal_mean",
+        "adv_total_mean",
+        "adv_total_std",
+        "adv_boundary_mean",
+        "adv_boundary_std",
+        "adv_internal_mean",
+        "adv_internal_std",
+        "adv_actor_mean",
+        "adv_actor_std",
+        "boundary_distance_mean",
+        "internal_distance_mean",
+        "boundary_share",
+        "internal_share",
+        "advantage_mode",
         "samples_seen",
         "num_envs",
         "n_traj",
@@ -2329,6 +2623,8 @@ def train_from_config(
             f"n_encode_layers={model_cfg.get('n_encode_layers', 2)} "
             f"use_graph_token={model_cfg.get('use_graph_token', True)} "
             f"use_dynamic_decision_encoder={model_cfg.get('use_dynamic_decision_encoder', False)} "
+            f"use_decomposed_critic={use_decomposed_critic} "
+            f"advantage_mode={critic_cfg.get('advantage_mode', 'total')} "
             f"mixed_precision={amp_enabled} "
             f"offline_method={offline_method} use_gae={use_gae} gae_lambda={gae_lambda} "
             f"expert_steps={expert_buffer.num_steps if expert_buffer is not None else 0} "
@@ -2347,6 +2643,31 @@ def train_from_config(
             bafipo_info: dict[str, Any] = {}
             gcbpo_info: dict[str, Any] = {}
             adv_info: dict[str, Any] = {}
+            decomposed_info: dict[str, Any] = {
+                "value_loss_total": 0.0,
+                "value_loss_boundary": 0.0,
+                "value_loss_internal": 0.0,
+                "value_consistency_loss": 0.0,
+                "explained_variance_total": np.nan,
+                "explained_variance_boundary": np.nan,
+                "explained_variance_internal": np.nan,
+                "return_total_mean": 0.0,
+                "return_boundary_mean": 0.0,
+                "return_internal_mean": 0.0,
+                "adv_total_mean": 0.0,
+                "adv_total_std": 0.0,
+                "adv_boundary_mean": 0.0,
+                "adv_boundary_std": 0.0,
+                "adv_internal_mean": 0.0,
+                "adv_internal_std": 0.0,
+                "adv_actor_mean": 0.0,
+                "adv_actor_std": 0.0,
+                "boundary_distance_mean": 0.0,
+                "internal_distance_mean": 0.0,
+                "boundary_share": 0.0,
+                "internal_share": 0.0,
+                "advantage_mode": critic_cfg.get("advantage_mode", "total"),
+            }
             bc_warmup_epochs = int(offline_cfg.get("bc_warmup_epochs", 0))
             bc_updates_per_epoch = int(offline_cfg.get("bc_updates_per_epoch", offline_cfg.get("offline_updates_per_epoch", 1)))
             route_updates_per_epoch = int(offline_cfg.get("route_updates_per_epoch", offline_cfg.get("offline_updates_per_epoch", 1)))
@@ -2397,14 +2718,25 @@ def train_from_config(
                     seed=seed + epoch * 100_000,
                     profile_timing=profile_timing,
                 )
-                if use_gae:
+                decomposed_returns: dict[str, torch.Tensor] | None = None
+                if use_decomposed_critic:
+                    decomposed_returns, decomposed_advantages, advantages, decomposed_info = _compute_decomposed_returns_advantages(
+                        batch,
+                        gamma=gamma,
+                        gae_lambda=gae_lambda,
+                        use_gae=use_gae,
+                        cfg=cfg,
+                    )
+                    returns = decomposed_returns
+                    decomposed_info.update(_decomposed_value_diagnostics(batch, decomposed_returns))
+                elif use_gae:
                     returns, advantages = _compute_gae_returns(batch, gamma=gamma, gae_lambda=gae_lambda)
+                    advantages = _normalize_valid(advantages, batch.valid)
                 else:
                     returns = compute_returns(batch.rewards, batch.dones, gamma=gamma)
-                    advantages = returns - batch.values
-                adv_vals = advantages[batch.valid]
-                if adv_vals.numel() > 1:
-                    advantages = (advantages - adv_vals.mean()) / (adv_vals.std(unbiased=False) + 1e-8)
+                    values = _value_head(batch.values, 0)
+                    advantages = returns - values
+                    advantages = _normalize_valid(advantages, batch.valid)
                 dapg_enabled = expert_buffer is not None and _is_dapg_method(offline_method)
                 bafipo_enabled = expert_buffer is not None and _is_bafipo_method(offline_method)
                 gcbpo_enabled = expert_buffer is not None and _is_gcbpo_method(offline_method)
@@ -2449,6 +2781,10 @@ def train_from_config(
                         expert_buffer,
                         device,
                     )
+                    if use_decomposed_critic:
+                        actor_mean, actor_std = _stats(advantages, batch.valid)
+                        decomposed_info["adv_actor_mean"] = actor_mean
+                        decomposed_info["adv_actor_std"] = actor_std
                     if bafipo_enabled:
                         bafipo_pairs, bafipo_incumbents, bafipo_prepare_info = _prepare_bafipo_preference_pairs(
                             agent,
@@ -2538,6 +2874,7 @@ def train_from_config(
                 sl_adv_means: list[float] = []
                 sl_adv_stds: list[float] = []
                 sl_route_counts: list[float] = []
+                decomposed_loss_infos: list[dict[str, float]] = []
                 frro_expert_losses: list[float] = []
                 frro_expert_ratio_means: list[float] = []
                 frro_expert_ratio_stds: list[float] = []
@@ -2566,17 +2903,33 @@ def train_from_config(
                                 step_end = min(step_start + chunk_size, total_steps)
                                 chunk_weight = float(step_end - step_start) / max(float(total_steps), 1.0)
                                 with _autocast_context(device, amp_enabled):
-                                    loss, policy_loss, value_loss, entropy = evaluate_policy_loss(
-                                        agent,
-                                        batch,
-                                        returns,
-                                        advantages.detach(),
-                                        cfg,
-                                        device,
-                                        env_indices=env_indices,
-                                        step_start=step_start,
-                                        step_end=step_end,
-                                    )
+                                    if use_decomposed_critic:
+                                        if decomposed_returns is None:
+                                            raise RuntimeError("decomposed critic enabled but decomposed returns are missing")
+                                        loss, policy_loss, value_loss, entropy, value_info = _evaluate_policy_loss_decomposed(
+                                            agent,
+                                            batch,
+                                            decomposed_returns,
+                                            advantages.detach(),
+                                            cfg,
+                                            device,
+                                            env_indices=env_indices,
+                                            step_start=step_start,
+                                            step_end=step_end,
+                                        )
+                                        decomposed_loss_infos.append(value_info)
+                                    else:
+                                        loss, policy_loss, value_loss, entropy = evaluate_policy_loss(
+                                            agent,
+                                            batch,
+                                            returns,
+                                            advantages.detach(),
+                                            cfg,
+                                            device,
+                                            env_indices=env_indices,
+                                            step_start=step_start,
+                                            step_end=step_end,
+                                        )
                                 _backward(loss * chunk_weight / group_size, scaler, amp_enabled)
                                 weighted_policy += policy_loss.item() * chunk_weight
                                 weighted_value += value_loss.item() * chunk_weight
@@ -2694,6 +3047,14 @@ def train_from_config(
                             offline_updates += 1
                         _optimizer_step(optimizer, agent, max_grad_norm, scaler, amp_enabled)
                         losses.append((group_policy, group_value, group_entropy))
+                if decomposed_loss_infos:
+                    for key in (
+                        "value_loss_total",
+                        "value_loss_boundary",
+                        "value_loss_internal",
+                        "value_consistency_loss",
+                    ):
+                        decomposed_info[key] = float(np.mean([info[key] for info in decomposed_loss_infos]))
                 if dapg_enabled:
                     bc_info = {
                         "bc_loss": float(np.mean(dapg_bc_losses)) if dapg_bc_losses else 0.0,
@@ -2809,6 +3170,9 @@ def train_from_config(
                     f"reward={_format_float(reward_mean)} "
                     f"policy_loss={_format_float(loss_arr[:, 0].mean())} "
                     f"value_loss={_format_float(loss_arr[:, 1].mean())} "
+                    f"value_heads={_format_float(decomposed_info.get('value_loss_total', 0.0))}/"
+                    f"{_format_float(decomposed_info.get('value_loss_boundary', 0.0))}/"
+                    f"{_format_float(decomposed_info.get('value_loss_internal', 0.0))} "
                     f"entropy={_format_float(loss_arr[:, 2].mean())} "
                     f"train_fr={_format_float(train_summary['train_feasible_rate'])} "
                     f"train_obj={_format_float(train_summary['train_avg_best_objective_distance_km'])} "
@@ -2891,6 +3255,29 @@ def train_from_config(
                     "policy_loss": float(loss_arr[:, 0].mean()),
                     "value_loss": float(loss_arr[:, 1].mean()),
                     "entropy": float(loss_arr[:, 2].mean()),
+                    "value_loss_total": decomposed_info.get("value_loss_total", ""),
+                    "value_loss_boundary": decomposed_info.get("value_loss_boundary", ""),
+                    "value_loss_internal": decomposed_info.get("value_loss_internal", ""),
+                    "value_consistency_loss": decomposed_info.get("value_consistency_loss", ""),
+                    "explained_variance_total": decomposed_info.get("explained_variance_total", ""),
+                    "explained_variance_boundary": decomposed_info.get("explained_variance_boundary", ""),
+                    "explained_variance_internal": decomposed_info.get("explained_variance_internal", ""),
+                    "return_total_mean": decomposed_info.get("return_total_mean", ""),
+                    "return_boundary_mean": decomposed_info.get("return_boundary_mean", ""),
+                    "return_internal_mean": decomposed_info.get("return_internal_mean", ""),
+                    "adv_total_mean": decomposed_info.get("adv_total_mean", ""),
+                    "adv_total_std": decomposed_info.get("adv_total_std", ""),
+                    "adv_boundary_mean": decomposed_info.get("adv_boundary_mean", ""),
+                    "adv_boundary_std": decomposed_info.get("adv_boundary_std", ""),
+                    "adv_internal_mean": decomposed_info.get("adv_internal_mean", ""),
+                    "adv_internal_std": decomposed_info.get("adv_internal_std", ""),
+                    "adv_actor_mean": decomposed_info.get("adv_actor_mean", ""),
+                    "adv_actor_std": decomposed_info.get("adv_actor_std", ""),
+                    "boundary_distance_mean": decomposed_info.get("boundary_distance_mean", ""),
+                    "internal_distance_mean": decomposed_info.get("internal_distance_mean", ""),
+                    "boundary_share": decomposed_info.get("boundary_share", ""),
+                    "internal_share": decomposed_info.get("internal_share", ""),
+                    "advantage_mode": decomposed_info.get("advantage_mode", ""),
                     "samples_seen": pool.sample_count,
                     "num_envs": num_envs,
                     "n_traj": int(train_cfg.get("n_traj", 50)),

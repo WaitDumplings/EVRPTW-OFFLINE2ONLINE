@@ -31,6 +31,15 @@ model:
   tanh_clipping: 15.0
   n_encode_layers: 2
   use_graph_token: true
+critic:
+  use_decomposed_critic: true
+  advantage_mode: total
+  value_coef_total: 1.0
+  value_coef_boundary: 0.5
+  value_coef_internal: 0.5
+  consistency_coef: 0.1
+  balanced_adv_weight_boundary: 0.3
+  balanced_adv_weight_internal: 0.7
 training:
   online_training: false
   epochs: 1000
