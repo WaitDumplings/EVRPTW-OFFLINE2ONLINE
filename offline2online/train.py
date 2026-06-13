@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-async-instance-prefetch", action="store_true")
     parser.add_argument("--async-instance-workers", type=int, default=None)
     parser.add_argument("--async-instance-queue-batches", type=int, default=None)
-    parser.add_argument("--offline-method", type=str, default=None, choices=["ppo", "bc_ppo", "dapg", "gadapg", "ga_dapg", "group_dapg", "route_bc_ppo", "sl_ppo", "frro", "bafipo", "ba_fipo", "gcbpo", "gcbpo_branch", "gcbpo_prefix"])
+    parser.add_argument("--offline-method", type=str, default=None, choices=["ppo", "bc_ppo", "awbc", "awbc_ppo", "dapg", "gadapg", "ga_dapg", "group_dapg", "route_bc_ppo", "sl_ppo", "frro", "bafipo", "ba_fipo", "gcbpo", "gcbpo_branch", "gcbpo_prefix"])
     parser.add_argument("--expert-solution-path", type=str, default=None)
     parser.add_argument("--expert-dataset-path", type=str, default=None)
     parser.add_argument("--expert-limit", type=int, default=None)

@@ -45,6 +45,10 @@ def build_agent(cfg: dict[str, Any], device: str | torch.device) -> Agent:
         use_graph_token=bool(model_cfg.get('use_graph_token', True)),
         use_dynamic_decision_encoder=bool(model_cfg.get('use_dynamic_decision_encoder', False)),
         dynamic_decision_heads=int(model_cfg.get('dynamic_decision_heads', 4)),
+        dynamic_delta_k=bool(model_cfg.get('dynamic_delta_k', True)),
+        dynamic_delta_v=bool(model_cfg.get('dynamic_delta_v', True)),
+        dynamic_delta_action_key=bool(model_cfg.get('dynamic_delta_action_key', True)),
+        dynamic_action_bias=bool(model_cfg.get('dynamic_action_bias', True)),
     ).to(device)
     return agent
 

@@ -64,7 +64,11 @@ def build_agent(cfg: dict[str, Any], device: str | torch.device) -> Agent:
         use_graph_token=bool(model_cfg.get("use_graph_token", True)),
         use_dynamic_decision_encoder=bool(model_cfg.get("use_dynamic_decision_encoder", False)),
         dynamic_decision_heads=int(model_cfg.get("dynamic_decision_heads", 4)),
-        use_decomposed_critic=bool(model_cfg.get("use_decomposed_critic", critic_cfg.get("use_decomposed_critic", True))),
+        dynamic_delta_k=bool(model_cfg.get("dynamic_delta_k", True)),
+        dynamic_delta_v=bool(model_cfg.get("dynamic_delta_v", True)),
+        dynamic_delta_action_key=bool(model_cfg.get("dynamic_delta_action_key", True)),
+        dynamic_action_bias=bool(model_cfg.get("dynamic_action_bias", True)),
+        use_decomposed_critic=bool(model_cfg.get("use_decomposed_critic", critic_cfg.get("use_decomposed_critic", False))),
     ).to(device)
 
 
@@ -102,7 +106,7 @@ def critic_shape_check(cfg: dict[str, Any], seed: int, device: str, num_envs: in
         obs_batch = stack_observations(observations)
         with torch.no_grad():
             values = agent.get_value(obs_batch)
-        expected_heads = 3 if bool(cfg.get("critic", {}).get("use_decomposed_critic", True)) else 1
+        expected_heads = 3 if bool(cfg.get("critic", {}).get("use_decomposed_critic", False)) else 1
         return {
             "value_shape": list(values.shape),
             "expected_last_dim": expected_heads,

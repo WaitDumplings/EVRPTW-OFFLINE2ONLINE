@@ -153,10 +153,23 @@ class DynamicGraphKVEncoder(nn.Module):
     scalar action bias.
     """
 
-    def __init__(self, embedding_dim, n_heads=4, enabled=False):
+    def __init__(
+        self,
+        embedding_dim,
+        n_heads=4,
+        enabled=False,
+        enable_key_delta=True,
+        enable_value_delta=True,
+        enable_action_key_delta=True,
+        enable_action_bias=True,
+    ):
         super().__init__()
         self.embedding_dim = int(embedding_dim)
         self.enabled = bool(enabled)
+        self.enable_key_delta = bool(enable_key_delta)
+        self.enable_value_delta = bool(enable_value_delta)
+        self.enable_action_key_delta = bool(enable_action_key_delta)
+        self.enable_action_bias = bool(enable_action_bias)
         self.routing_system_feature_dim = 10
         self.problem_system_feature_dim = 5
         self.system_feature_dim = (
@@ -696,6 +709,14 @@ class DynamicGraphKVEncoder(nn.Module):
         value_delta = torch.tanh(self.value_scale) * value_delta
         action_key_delta = torch.tanh(self.action_key_scale) * action_key_delta
         action_bias = torch.tanh(self.action_bias_scale) * action_bias
+        if not self.enable_key_delta:
+            key_delta = torch.zeros_like(key_delta)
+        if not self.enable_value_delta:
+            value_delta = torch.zeros_like(value_delta)
+        if not self.enable_action_key_delta:
+            action_key_delta = torch.zeros_like(action_key_delta)
+        if not self.enable_action_bias:
+            action_bias = torch.zeros_like(action_bias)
         return key_delta, value_delta, action_key_delta, action_bias
 
 
@@ -724,6 +745,10 @@ class Decoder(nn.Module):
         tanh_clipping,
         use_dynamic_decision_encoder=False,
         dynamic_decision_heads=4,
+        dynamic_delta_k=True,
+        dynamic_delta_v=True,
+        dynamic_delta_action_key=True,
+        dynamic_action_bias=True,
     ):
         super().__init__()
 
@@ -748,6 +773,10 @@ class Decoder(nn.Module):
             embedding_dim=embedding_dim,
             n_heads=dynamic_decision_heads,
             enabled=use_dynamic_decision_encoder,
+            enable_key_delta=dynamic_delta_k,
+            enable_value_delta=dynamic_delta_v,
+            enable_action_key_delta=dynamic_delta_action_key,
+            enable_action_bias=dynamic_action_bias,
         )
 
         # glimpse + pointer

@@ -41,6 +41,7 @@ from .models import Agent
 from .offline_data import (
     ExpertReplayBuffer,
     build_expert_trajectories,
+    compute_awbc_loss,
     compute_bc_loss,
     compute_route_supervised_loss,
     load_solver_expert_records,
@@ -159,6 +160,10 @@ def _is_dapg_method(method: str) -> bool:
     return method in {"dapg", "bc_dapg", "bc+ppo", "gadapg", "ga_dapg", "ga-dapg", "group_dapg", "group-dapg"}
 
 
+def _is_awbc_method(method: str) -> bool:
+    return method in {"awbc", "awbc_ppo", "awbc-ppo", "advantage_weighted_bc", "advantage-weighted-bc"}
+
+
 def _is_bafipo_method(method: str) -> bool:
     return method in {"bafipo", "ba_fipo", "ba-fipo", "branch_aware_fipo", "branch-aware-fipo"}
 
@@ -189,6 +194,7 @@ def _requires_expert_routes(method: str) -> bool:
     return (
         method in {"bc_ppo", "bc-ppo"}
         or _is_dapg_method(method)
+        or _is_awbc_method(method)
         or _is_bafipo_method(method)
         or _is_gcbpo_method(method)
         or _is_route_bc_method(method)
@@ -867,6 +873,7 @@ def _dapg_demo_gate_from_rollout(
     objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
     eta = max(float(offline_cfg.get("dapg_demo_gate_eta", 0.05)), 1e-8)
     margin = max(float(offline_cfg.get("dapg_demo_gate_margin", 0.0)), 0.0)
+    policy_base = str(offline_cfg.get("dapg_demo_gate_policy_base", "best_successful")).lower()
     use_memory = bool(offline_cfg.get("use_dapg_memory_gate", True))
     gates: list[float] = []
     memory_better = 0
@@ -876,10 +883,14 @@ def _dapg_demo_gate_from_rollout(
         ref_obj = expert_buffer.reference_objective(instance_id)
         if ref_obj is None or not np.isfinite(ref_obj) or ref_obj <= 0.0:
             continue
-        best_known = np.inf
         current_success = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
         if current_success.size > 0:
-            best_known = min(best_known, float(np.min(current_success)))
+            if policy_base in {"mean_successful", "mean", "avg_successful", "average_successful"}:
+                best_known = float(np.mean(current_success))
+            else:
+                best_known = float(np.min(current_success))
+        else:
+            best_known = np.inf
         if use_memory and policy_best_objectives is not None and instance_id is not None:
             memory_obj = policy_best_objectives.get(instance_id)
             if memory_obj is not None and np.isfinite(memory_obj) and memory_obj > 0.0:
@@ -990,7 +1001,7 @@ def _decomposed_critic_config(cfg: dict[str, Any]) -> dict[str, Any]:
     ):
         if key in train_cfg and key not in out:
             out[key] = train_cfg[key]
-    out.setdefault("use_decomposed_critic", True)
+    out.setdefault("use_decomposed_critic", False)
     out.setdefault("advantage_mode", "total")
     out.setdefault("value_coef_total", 1.0)
     out.setdefault("value_coef_boundary", 0.5)
@@ -2394,7 +2405,7 @@ def train_from_config(
     offline_method = _offline_method(cfg)
     model_cfg = cfg.get("model", {})
     critic_cfg = _decomposed_critic_config(cfg)
-    use_decomposed_critic = bool(model_cfg.get("use_decomposed_critic", critic_cfg.get("use_decomposed_critic", True)))
+    use_decomposed_critic = bool(model_cfg.get("use_decomposed_critic", critic_cfg.get("use_decomposed_critic", False)))
     cfg.setdefault("env", {})["use_fast_env"] = True
     cfg["env"].setdefault("info_level", "light")
     run_name = str(cfg.get("run_name", "O2O_TERRAN_FULL"))
@@ -2414,6 +2425,10 @@ def train_from_config(
             model_cfg.get("use_dynamic_decision_encoder", False)
         ),
         dynamic_decision_heads=int(model_cfg.get("dynamic_decision_heads", 4)),
+        dynamic_delta_k=bool(model_cfg.get("dynamic_delta_k", True)),
+        dynamic_delta_v=bool(model_cfg.get("dynamic_delta_v", True)),
+        dynamic_delta_action_key=bool(model_cfg.get("dynamic_delta_action_key", True)),
+        dynamic_action_bias=bool(model_cfg.get("dynamic_action_bias", True)),
         use_decomposed_critic=use_decomposed_critic,
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -2502,6 +2517,11 @@ def train_from_config(
         "bc_accuracy",
         "bc_entropy",
         "bc_coef",
+        "awbc_loss",
+        "awbc_weight_mean",
+        "awbc_weight_std",
+        "awbc_active_ratio",
+        "awbc_expert_better_ratio",
         "dapg_demo_gate_mean",
         "dapg_demo_gate_std",
         "dapg_memory_better_rate",
@@ -2654,6 +2674,10 @@ def train_from_config(
             f"n_encode_layers={model_cfg.get('n_encode_layers', 2)} "
             f"use_graph_token={model_cfg.get('use_graph_token', True)} "
             f"use_dynamic_decision_encoder={model_cfg.get('use_dynamic_decision_encoder', False)} "
+            f"dynamic_delta_k={model_cfg.get('dynamic_delta_k', True)} "
+            f"dynamic_delta_v={model_cfg.get('dynamic_delta_v', True)} "
+            f"dynamic_delta_action_key={model_cfg.get('dynamic_delta_action_key', True)} "
+            f"dynamic_action_bias={model_cfg.get('dynamic_action_bias', True)} "
             f"use_decomposed_critic={use_decomposed_critic} "
             f"advantage_mode={critic_cfg.get('advantage_mode', 'total')} "
             f"mixed_precision={amp_enabled} "
@@ -2773,6 +2797,7 @@ def train_from_config(
                     advantages = returns - values
                     advantages = _normalize_valid(advantages, batch.valid)
                 dapg_enabled = expert_buffer is not None and _is_dapg_method(offline_method)
+                awbc_enabled = expert_buffer is not None and _is_awbc_method(offline_method)
                 bafipo_enabled = expert_buffer is not None and _is_bafipo_method(offline_method)
                 gcbpo_enabled = expert_buffer is not None and _is_gcbpo_method(offline_method)
                 dapg_demo_gate = 1.0
@@ -2883,6 +2908,14 @@ def train_from_config(
                 dapg_bc_accs: list[float] = []
                 dapg_bc_entropies: list[float] = []
                 dapg_bc_steps = 0
+                awbc_weight_means: list[float] = []
+                awbc_weight_stds: list[float] = []
+                awbc_active_ratios: list[float] = []
+                awbc_expert_better_ratios: list[float] = []
+                awbc_coef = float(offline_cfg.get("awbc_coef", offline_cfg.get("bc_coef", 0.05)))
+                awbc_eta = float(offline_cfg.get("awbc_eta", 0.05))
+                awbc_normalize = str(offline_cfg.get("awbc_normalize", "p95"))
+                awbc_baseline = str(offline_cfg.get("awbc_baseline", "batch_mean"))
                 bafipo_pref_coef = float(_bafipo_config(cfg)["pref_coef"])
                 bafipo_minibatches_per_ppo_epoch = int(offline_cfg.get("bafipo_minibatches_per_ppo_epoch", 0) or 0)
                 bafipo_pref_losses: list[float] = []
@@ -3080,6 +3113,27 @@ def train_from_config(
                             dapg_bc_entropies.append(float(demo_info["bc_entropy"]))
                             dapg_bc_steps += int(demo_info["bc_steps"])
                             offline_updates += 1
+                        if awbc_enabled and awbc_coef > 0.0 and expert_buffer is not None:
+                            with _autocast_context(device, amp_enabled):
+                                demo_loss, demo_info = compute_awbc_loss(
+                                    agent,
+                                    expert_buffer,
+                                    batch_size=dapg_bc_batch_size,
+                                    device=device,
+                                    eta=awbc_eta,
+                                    normalize=awbc_normalize,
+                                    baseline=awbc_baseline,
+                                )
+                            _backward(float(awbc_coef) * demo_loss, scaler, amp_enabled)
+                            dapg_bc_losses.append(float(demo_info["bc_loss"]))
+                            dapg_bc_accs.append(float(demo_info["bc_accuracy"]))
+                            dapg_bc_entropies.append(float(demo_info["bc_entropy"]))
+                            dapg_bc_steps += int(demo_info["bc_steps"])
+                            awbc_weight_means.append(float(demo_info["awbc_weight_mean"]))
+                            awbc_weight_stds.append(float(demo_info["awbc_weight_std"]))
+                            awbc_active_ratios.append(float(demo_info["awbc_active_ratio"]))
+                            awbc_expert_better_ratios.append(float(demo_info["awbc_expert_better_ratio"]))
+                            offline_updates += 1
                         _optimizer_step(optimizer, agent, max_grad_norm, scaler, amp_enabled)
                         losses.append((group_policy, group_value, group_entropy))
                 if decomposed_loss_infos:
@@ -3090,14 +3144,19 @@ def train_from_config(
                         "value_consistency_loss",
                     ):
                         decomposed_info[key] = float(np.mean([info[key] for info in decomposed_loss_infos]))
-                if dapg_enabled:
+                if dapg_enabled or awbc_enabled:
                     bc_info = {
                         "bc_loss": float(np.mean(dapg_bc_losses)) if dapg_bc_losses else 0.0,
                         "bc_accuracy": float(np.mean(dapg_bc_accs)) if dapg_bc_accs else 0.0,
                         "bc_entropy": float(np.mean(dapg_bc_entropies)) if dapg_bc_entropies else 0.0,
                         "bc_steps": int(dapg_bc_steps),
-                        "bc_coef": float(dapg_demo_coef),
+                        "bc_coef": float(awbc_coef if awbc_enabled else dapg_demo_coef),
                         "offline_updates": int(offline_updates),
+                        "awbc_loss": float(np.mean(dapg_bc_losses)) if (awbc_enabled and dapg_bc_losses) else 0.0,
+                        "awbc_weight_mean": float(np.mean(awbc_weight_means)) if awbc_weight_means else 0.0,
+                        "awbc_weight_std": float(np.mean(awbc_weight_stds)) if awbc_weight_stds else 0.0,
+                        "awbc_active_ratio": float(np.mean(awbc_active_ratios)) if awbc_active_ratios else 0.0,
+                        "awbc_expert_better_ratio": float(np.mean(awbc_expert_better_ratios)) if awbc_expert_better_ratios else 0.0,
                     }
                 if bafipo_enabled:
                     bafipo_info = {
@@ -3332,6 +3391,11 @@ def train_from_config(
                     "bc_accuracy": bc_info.get("bc_accuracy", ""),
                     "bc_entropy": bc_info.get("bc_entropy", ""),
                     "bc_coef": bc_info.get("bc_coef", ""),
+                    "awbc_loss": bc_info.get("awbc_loss", ""),
+                    "awbc_weight_mean": bc_info.get("awbc_weight_mean", ""),
+                    "awbc_weight_std": bc_info.get("awbc_weight_std", ""),
+                    "awbc_active_ratio": bc_info.get("awbc_active_ratio", ""),
+                    "awbc_expert_better_ratio": bc_info.get("awbc_expert_better_ratio", ""),
                     "dapg_demo_gate_mean": adv_info.get("dapg_demo_gate_mean", ""),
                     "dapg_demo_gate_std": adv_info.get("dapg_demo_gate_std", ""),
                     "dapg_memory_better_rate": adv_info.get("dapg_memory_better_rate", ""),

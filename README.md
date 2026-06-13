@@ -60,30 +60,46 @@ Dynamic embedding is disabled by default. Graph token remains enabled. The train
 
 ## Backbone Freeze Protocol
 
-Before adding DDE or offline objectives, freeze the backbone with static decoder semantics and the distance-decomposed critic. Use the semantic checker first:
+Before adding DDE or offline objectives, freeze the backbone with the B1 static decoder semantics and a single total-distance critic. Use the semantic checker first:
 
 ```bash
-python -m offline2online.backbone_semantics --config configs/cus50_backbone_b2_decomp_total.yaml \
+python -m offline2online.backbone_semantics --config configs/cus50_backbone_b1_static_qkv_single_critic.yaml \
   --seed 2005 --device cpu --num-envs 2 --n-traj 4 --rollout-steps 8
 ```
 
-Backbone configs for the B0-B4 sequence are:
+The frozen default backbone is:
+
+- `critic.use_decomposed_critic: false`
+- `critic.advantage_mode: total`
+- driver-side query from route/vehicle state
+- candidate-side static K/V/ActionKey memory
+- fast env mask semantics, including charging-station once-per-route constraints
+- pure distance reward with dataset reward normalization
+
+Backbone configs for the B0-B4 diagnostic sequence are:
 
 - `cus50_backbone_b0_legacy_static_single_critic.yaml`: legacy-compatible static single-critic PPO path.
-- `cus50_backbone_b1_static_qkv_single_critic.yaml`: static Q/K/V/ActionKey decoder with single critic.
-- `cus50_backbone_b2_decomp_total.yaml`: three-head critic, actor advantage from normalized total GAE.
-- `cus50_backbone_b3_decomp_exact.yaml`: three-head critic, actor advantage from exact boundary + internal GAE sum.
-- `cus50_backbone_b4_decomp_balanced_0505.yaml`: separately normalized boundary/internal advantages, 0.5/0.5 weights.
-- `cus50_backbone_b4_decomp_balanced_0307.yaml`: separately normalized boundary/internal advantages, 0.3/0.7 weights.
+- `cus50_backbone_b1_static_qkv_single_critic.yaml`: static Q/K/V/ActionKey decoder with single critic, used as the default backbone.
+- `cus50_backbone_b2_decomp_total.yaml`: appendix diagnostic, three-head critic with actor advantage from normalized total GAE.
+- `cus50_backbone_b3_decomp_exact.yaml`: appendix diagnostic, three-head critic with actor advantage from exact boundary + internal GAE sum.
+- `cus50_backbone_b4_decomp_balanced_0505.yaml`: disabled diagnostic, separately normalized boundary/internal advantages with 0.5/0.5 weights.
+- `cus50_backbone_b4_decomp_balanced_0307.yaml`: disabled diagnostic, separately normalized boundary/internal advantages with 0.3/0.7 weights.
 
-The decomposed reward semantics are: depot-related edges are `boundary`, all non-depot edges including charging-station edges are `internal`, and `reward_total = reward_boundary + reward_internal` at every transition.
+The decomposed reward semantics are retained only for diagnostics: depot-related edges are `boundary`, all non-depot edges including charging-station edges are `internal`, and `reward_total = reward_boundary + reward_internal` at every transition. The decomposed critic can fit these returns, but it is not used in main experiments because it did not consistently improve policy quality; balanced decomposed advantages are disabled because they can distort the total-distance objective and route count.
 
-The optional Dynamic Decision Encoder (`model.use_dynamic_decision_encoder: true`) is implemented as a key/value-only decoder adapter. Its input schema is split into a routing-generic core and an EVRPTW constraint supplement:
+The optional Dynamic Decision Encoder (`model.use_dynamic_decision_encoder: true`) is implemented as a candidate-memory decoder adapter. It can independently enable `model.dynamic_delta_k`, `model.dynamic_delta_v`, `model.dynamic_delta_action_key`, and `model.dynamic_action_bias`. Its input schema is split into a routing-generic core and an EVRPTW constraint supplement:
 
 - Routing core: feasible frontier state, depot/customer/auxiliary node type, route membership, visit/order memory, current/previous candidate flags, current-to-candidate cost, return-to-depot cost, and depot-detour cost.
 - EVRPTW supplement: load, battery, time-window, waiting, service-finish, and charging-station repeat margins.
 
 This keeps the DDE reusable for other routing variants while allowing problem-specific constraints to be added as supplements.
+
+DDE ablation configs for Cus15 are:
+
+- `cus15_dde0_static_single_critic.yaml`: static B1 baseline, no DDE.
+- `cus15_dde1_action_bias_only.yaml`: DDE scalar action bias only.
+- `cus15_dde2_action_key_bias.yaml`: DynamicActionKey plus scalar action bias.
+- `cus15_dde3_full_residual.yaml`: residual K/V/ActionKey plus scalar action bias.
 
 ## SL-PPO Semantics
 

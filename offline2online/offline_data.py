@@ -267,17 +267,26 @@ class ExpertReplayBuffer:
         return self.trajectory_by_instance_id.get(str(instance_id))
 
     def sample_step_batch(self, batch_size: int) -> tuple[dict[str, np.ndarray], torch.Tensor]:
+        obs_batch, action_tensor, _ = self.sample_step_batch_with_objectives(batch_size)
+        return obs_batch, action_tensor
+
+    def sample_step_batch_with_objectives(
+        self, batch_size: int
+    ) -> tuple[dict[str, np.ndarray], torch.Tensor, torch.Tensor]:
         indices = self.rng.integers(0, len(self._step_index), size=max(1, int(batch_size)))
         observations = []
         actions = []
+        objectives = []
         for index in indices:
             traj_idx, step_idx = self._step_index[int(index)]
             traj = self.trajectories[traj_idx]
             observations.append(traj.observations[step_idx])
             actions.append(traj.actions[step_idx])
+            objectives.append(float(traj.objective_distance_km))
         obs_batch = stack_observations(observations)
         action_tensor = torch.as_tensor(np.asarray(actions, dtype=np.int64)[:, None], dtype=torch.long)
-        return obs_batch, action_tensor
+        objective_tensor = torch.as_tensor(np.asarray(objectives, dtype=np.float32), dtype=torch.float32)
+        return obs_batch, action_tensor, objective_tensor
 
     def sample_route_batch(self, batch_size: int) -> tuple[dict[str, np.ndarray], torch.Tensor, torch.Tensor]:
         traj_indices = self.rng.integers(0, len(self.trajectories), size=max(1, int(batch_size)))
@@ -312,6 +321,72 @@ def compute_bc_loss(agent, buffer: ExpertReplayBuffer, batch_size: int, device: 
         "bc_accuracy": float(acc.detach().cpu().item()),
         "bc_entropy": float(entropy_flat.mean().detach().cpu().item()),
         "bc_steps": int(action.numel()),
+    }
+
+
+
+
+def compute_awbc_loss(
+    agent,
+    buffer: ExpertReplayBuffer,
+    batch_size: int,
+    device: str | torch.device,
+    *,
+    eta: float = 0.05,
+    normalize: str = "p95",
+    baseline: str = "batch_mean",
+):
+    """Advantage-weighted BC over solver demonstrations.
+
+    Lower objective is better. This smoke-test AWBC assigns positive weight to
+    expert steps whose route objective is better than a batch-level baseline.
+    The normalized positive advantage is clipped to [0, 1], matching the
+    intended conservative offline guidance protocol.
+    """
+    obs_batch, action, objective = buffer.sample_step_batch_with_objectives(batch_size)
+    action = action.to(device)
+    objective = objective.to(device)
+    _, logprob, entropy, _ = agent.get_action_and_value(obs_batch, action=action)
+    logprob_flat = logprob.reshape(-1)
+    entropy_flat = entropy.reshape(-1)
+    obj_flat = objective.reshape(-1).to(logprob_flat.dtype)
+
+    with torch.no_grad():
+        if baseline == "batch_median":
+            base = torch.quantile(obj_flat, 0.5)
+        elif baseline == "batch_p75":
+            base = torch.quantile(obj_flat, 0.75)
+        elif baseline == "batch_p90":
+            base = torch.quantile(obj_flat, 0.90)
+        else:
+            base = obj_flat.mean()
+        adv_pos = torch.clamp(base - obj_flat, min=0.0)
+        positive = adv_pos[adv_pos > 0]
+        if normalize == "eta_objective":
+            denom = torch.clamp(float(eta) * obj_flat.abs(), min=1e-8)
+            weights = torch.clamp(adv_pos / denom, 0.0, 1.0)
+        elif positive.numel() > 0:
+            q = torch.quantile(positive, 0.95)
+            weights = torch.clamp(adv_pos / torch.clamp(q, min=1e-8), 0.0, 1.0)
+        else:
+            weights = torch.zeros_like(adv_pos)
+    denom = weights.sum().clamp_min(1.0)
+    loss = -(weights * logprob_flat).sum() / denom
+    with torch.no_grad():
+        _, logits = agent(obs_batch)
+        pred_action = logits.reshape(-1, logits.size(-1)).argmax(dim=-1)
+        acc = (pred_action == action.reshape(-1)).float().mean()
+        active = weights > 0
+    return loss, {
+        "bc_loss": float(loss.detach().cpu().item()),
+        "bc_accuracy": float(acc.detach().cpu().item()),
+        "bc_entropy": float(entropy_flat.mean().detach().cpu().item()),
+        "bc_steps": int(action.numel()),
+        "awbc_loss": float(loss.detach().cpu().item()),
+        "awbc_weight_mean": float(weights.mean().detach().cpu().item()),
+        "awbc_weight_std": float(weights.std(unbiased=False).detach().cpu().item()),
+        "awbc_active_ratio": float(active.float().mean().detach().cpu().item()),
+        "awbc_expert_better_ratio": float(active.float().mean().detach().cpu().item()),
     }
 
 

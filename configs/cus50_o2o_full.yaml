@@ -30,7 +30,7 @@ model:
   n_encode_layers: 2
   use_graph_token: true
 critic:
-  use_decomposed_critic: true
+  use_decomposed_critic: false
   advantage_mode: total
   value_coef_total: 1.0
   value_coef_boundary: 0.5

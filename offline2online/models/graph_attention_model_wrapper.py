@@ -152,6 +152,10 @@ class Backbone(nn.Module):
         use_graph_token: bool = True,
         use_dynamic_decision_encoder: bool = False,
         dynamic_decision_heads: int = 4,
+        dynamic_delta_k: bool = True,
+        dynamic_delta_v: bool = True,
+        dynamic_delta_action_key: bool = True,
+        dynamic_action_bias: bool = True,
     ):
         super().__init__()
         del use_graph_token  # graph token is intrinsic to the migrated graph encoder.
@@ -171,6 +175,10 @@ class Backbone(nn.Module):
             tanh_clipping=tanh_clipping,
             use_dynamic_decision_encoder=use_dynamic_decision_encoder,
             dynamic_decision_heads=dynamic_decision_heads,
+            dynamic_delta_k=dynamic_delta_k,
+            dynamic_delta_v=dynamic_delta_v,
+            dynamic_delta_action_key=dynamic_delta_action_key,
+            dynamic_action_bias=dynamic_action_bias,
         )
 
         self.dist_bias_scale = nn.Parameter(torch.tensor(1.0))
@@ -297,6 +305,10 @@ class Agent(nn.Module):
         use_graph_token: bool = True,
         use_dynamic_decision_encoder: bool = False,
         dynamic_decision_heads: int = 4,
+        dynamic_delta_k: bool = True,
+        dynamic_delta_v: bool = True,
+        dynamic_delta_action_key: bool = True,
+        dynamic_action_bias: bool = True,
         use_decomposed_critic: bool = False,
     ):
         super().__init__()
@@ -309,6 +321,10 @@ class Agent(nn.Module):
             use_graph_token=use_graph_token,
             use_dynamic_decision_encoder=use_dynamic_decision_encoder,
             dynamic_decision_heads=dynamic_decision_heads,
+            dynamic_delta_k=dynamic_delta_k,
+            dynamic_delta_v=dynamic_delta_v,
+            dynamic_delta_action_key=dynamic_delta_action_key,
+            dynamic_action_bias=dynamic_action_bias,
         )
         self.actor = Actor()
         self.critic = Critic(hidden_size=embedding_dim, use_decomposed_critic=use_decomposed_critic)

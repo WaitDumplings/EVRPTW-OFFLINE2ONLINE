@@ -34,7 +34,7 @@ model:
   use_dynamic_decision_encoder: true
   dynamic_decision_heads: 4
 critic:
-  use_decomposed_critic: true
+  use_decomposed_critic: false
   advantage_mode: total
   value_coef_total: 1.0
   value_coef_boundary: 0.5

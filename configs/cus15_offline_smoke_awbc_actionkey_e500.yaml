@@ -1,10 +1,10 @@
-run_name: O2O_CUS50_SL_PPO_GROUP_REF_R70_U2_E1000
+run_name: O2O_CUS15_OFFLINE_SMOKE_AWBC_ACTIONKEY_R40_U3_NE64_MB4_E500
 dataset_name: EVRPTW-D_Geo-AC-v1
 data:
   generator_config: configs/amazon_hierarchy.yaml
-  num_customers: 50
-  num_charging_stations: 10
-  mother_board_pool_size: 8
+  num_customers: 15
+  num_charging_stations: 3
+  mother_board_pool_size: 32
   mother_num_customers: 5000
   mother_num_charging_stations: 120
   region_reuse_limit: 200
@@ -13,7 +13,7 @@ data:
   region_pool_path: null
   region_pool_shuffle: true
   region_pool_replacement_policy: cycle
-  train_dataset_path: /data/Maojie/dataset_v1/dataset/train/Cus50
+  train_dataset_path: EVRPTW_Dataset/dataset_v1/dataset/train/Cus15
   train_sample_mode: shuffle_cycle
   async_instance_prefetch: false
   async_instance_workers: 8
@@ -31,6 +31,12 @@ model:
   tanh_clipping: 15.0
   n_encode_layers: 2
   use_graph_token: true
+  use_dynamic_decision_encoder: true
+  dynamic_decision_heads: 4
+  dynamic_delta_k: false
+  dynamic_delta_v: false
+  dynamic_delta_action_key: true
+  dynamic_action_bias: false
 critic:
   use_decomposed_critic: false
   advantage_mode: total
@@ -42,13 +48,13 @@ critic:
   balanced_adv_weight_internal: 0.7
 training:
   online_training: false
-  epochs: 1000
-  num_envs_per_gpu: 640
+  epochs: 500
+  num_envs_per_gpu: 64
   n_traj: 50
-  rollout_steps: 70
+  rollout_steps: 40
   ppo_step_chunk_size: 64
-  ppo_update_epochs: 2
-  num_minibatches: 16
+  ppo_update_epochs: 3
+  num_minibatches: 4
   gamma: 0.99
   clip_coef: 0.2
   vf_coef: 0.5
@@ -59,8 +65,8 @@ training:
   checkpoint_interval: 50
   debug: true
   debug_log_every: 1
-  profile_timing: false
-  gradient_accumulation_steps: 2
+  profile_timing: true
+  gradient_accumulation_steps: 1
   mixed_precision: true
 pbrs:
   use_customer_pbrs: false
@@ -69,34 +75,35 @@ pbrs:
   use_terminal_heuristic: false
 evaluation:
   eval_interval: 10
-  eval_path: /data/Maojie/dataset_v1/dataset/val/Cus50
+  eval_path: EVRPTW_Dataset/dataset_v1/dataset/val/Cus15
   eval_n_traj: 50
   eval_decode_mode: sample
-  eval_max_steps: 70
+  eval_max_steps: 40
   eval_limit: null
-  eval_batch_size: 250
+  eval_batch_size: 1000
   eval_num_batches: null
   eval_info_level: light
   eval_save_routes: false
 offline:
-  method: sl_ppo
-  expert_solution_path: /data/Maojie/gurobi_mul/results/train/Cus50/gurobi_summary.csv
-  expert_dataset_path: /data/Maojie/dataset_v1/dataset/train/Cus50
+  method: awbc
+  expert_solution_path: /data/Maojie/Github2/Cus15/train/gurobi_summary.csv
+  expert_dataset_path: EVRPTW_Dataset/dataset_v1/dataset/train/Cus15
   expert_limit: null
   strict_replay: true
-  sl_coef: 0.1
-  route_clip_eps: 0.2
-  only_success_route_loss: true
+  bc_warmup_epochs: 0
+  bc_batch_size: 512
+  bc_updates_per_epoch: 16
+  bc_coef: 0.05
+  awbc_coef: 0.05
+  awbc_eta: 0.05
+  awbc_normalize: p95
+  awbc_baseline: batch_mean
 advantage:
-  use_group_advantage: true
-  group_adv_coef: 0.3
+  use_group_advantage: false
+  group_adv_coef: 0.0
   group_adv_clip: 3.0
   group_adv_std_floor: 5.0
-  use_reference_advantage: true
-  reference_adv_coef: 0.1
-  reference_adv_rho: 0.1
-  reference_adv_clip: 2.0
-  reference_success_only: true
-  use_reference_soft_gate: true
-  reference_soft_gate_eta: 0.05
-  reference_policy_estimate: best
+  group_infeasible_penalty: 10.0
+  renormalize_after_aux_advantage: true
+  use_reference_advantage: false
+  use_frro: false
