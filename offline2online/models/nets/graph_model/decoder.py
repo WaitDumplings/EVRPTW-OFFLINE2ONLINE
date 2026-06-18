@@ -153,10 +153,23 @@ class DynamicGraphKVEncoder(nn.Module):
     scalar action bias.
     """
 
-    def __init__(self, embedding_dim, n_heads=4, enabled=False):
+    def __init__(
+        self,
+        embedding_dim,
+        n_heads=4,
+        enabled=False,
+        enable_delta_k=True,
+        enable_delta_v=True,
+        enable_delta_action_key=True,
+        enable_action_bias=True,
+    ):
         super().__init__()
         self.embedding_dim = int(embedding_dim)
         self.enabled = bool(enabled)
+        self.enable_delta_k = bool(enable_delta_k)
+        self.enable_delta_v = bool(enable_delta_v)
+        self.enable_delta_action_key = bool(enable_delta_action_key)
+        self.enable_action_bias = bool(enable_action_bias)
         self.routing_system_feature_dim = 10
         self.problem_system_feature_dim = 5
         self.system_feature_dim = (
@@ -193,6 +206,12 @@ class DynamicGraphKVEncoder(nn.Module):
             nn.Linear(2 * embedding_dim, embedding_dim),
         )
         self.token_ff_norm = nn.LayerNorm(embedding_dim)
+        self.route_pos_proj = nn.Sequential(
+            nn.LayerNorm(4 * embedding_dim),
+            nn.Linear(4 * embedding_dim, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
         self.node_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
         self.decision_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
         self.step_state_proj = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
@@ -202,6 +221,14 @@ class DynamicGraphKVEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(embedding_dim, 3 * embedding_dim),
         )
+        self.candidate_delta_base = nn.Sequential(
+            nn.LayerNorm(self.candidate_feature_dim),
+            nn.Linear(self.candidate_feature_dim, embedding_dim),
+            nn.SiLU(),
+        )
+        self.candidate_key_delta_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.candidate_value_delta_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.candidate_action_key_delta_proj = nn.Linear(embedding_dim, embedding_dim)
         self.action_bias_proj = nn.Sequential(
             nn.LayerNorm(self.candidate_feature_dim),
             nn.Linear(self.candidate_feature_dim, embedding_dim),
@@ -218,6 +245,10 @@ class DynamicGraphKVEncoder(nn.Module):
         nn.init.zeros_(self.state_proj[1].bias)
         nn.init.xavier_uniform_(self.state_proj[3].weight, gain=0.5)
         nn.init.zeros_(self.state_proj[3].bias)
+        nn.init.xavier_uniform_(self.route_pos_proj[1].weight, gain=0.5)
+        nn.init.zeros_(self.route_pos_proj[1].bias)
+        nn.init.zeros_(self.route_pos_proj[3].weight)
+        nn.init.zeros_(self.route_pos_proj[3].bias)
         nn.init.zeros_(self.node_state_proj.weight)
         nn.init.zeros_(self.decision_state_proj.weight)
         nn.init.zeros_(self.step_state_proj.weight)
@@ -225,6 +256,14 @@ class DynamicGraphKVEncoder(nn.Module):
         nn.init.zeros_(self.candidate_feature_proj[1].bias)
         nn.init.zeros_(self.candidate_feature_proj[3].weight)
         nn.init.zeros_(self.candidate_feature_proj[3].bias)
+        nn.init.xavier_uniform_(self.candidate_delta_base[1].weight, gain=0.5)
+        nn.init.zeros_(self.candidate_delta_base[1].bias)
+        nn.init.zeros_(self.candidate_key_delta_proj.weight)
+        nn.init.zeros_(self.candidate_key_delta_proj.bias)
+        nn.init.zeros_(self.candidate_value_delta_proj.weight)
+        nn.init.zeros_(self.candidate_value_delta_proj.bias)
+        nn.init.zeros_(self.candidate_action_key_delta_proj.weight)
+        nn.init.zeros_(self.candidate_action_key_delta_proj.bias)
         nn.init.xavier_uniform_(self.action_bias_proj[1].weight, gain=0.5)
         nn.init.zeros_(self.action_bias_proj[1].bias)
         nn.init.zeros_(self.action_bias_proj[3].weight)
@@ -295,6 +334,27 @@ class DynamicGraphKVEncoder(nn.Module):
         return torch.matmul(mask, node_embeddings) / denom
 
     @staticmethod
+    def _signed_weighted_mean(node_embeddings, mask, weights):
+        mask = mask.to(device=node_embeddings.device, dtype=node_embeddings.dtype)
+        weights = weights.to(device=node_embeddings.device, dtype=node_embeddings.dtype)
+        denom = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return torch.matmul(mask * weights, node_embeddings) / denom
+
+    def _route_position_summary(self, node_embeddings, route_mask, route_order):
+        order = route_order.to(device=node_embeddings.device, dtype=node_embeddings.dtype).clamp(0.0, 1.0)
+        angle = order * (2.0 * torch.pi)
+        features = torch.cat(
+            [
+                self._signed_weighted_mean(node_embeddings, route_mask, torch.sin(angle)),
+                self._signed_weighted_mean(node_embeddings, route_mask, torch.cos(angle)),
+                self._signed_weighted_mean(node_embeddings, route_mask, torch.sin(2.0 * angle)),
+                self._signed_weighted_mean(node_embeddings, route_mask, torch.cos(2.0 * angle)),
+            ],
+            dim=-1,
+        )
+        return self.route_pos_proj(features)
+
+    @staticmethod
     def _gather_node(node_embeddings, node_idx):
         if node_idx.dim() == 1:
             node_idx = node_idx.unsqueeze(1)
@@ -302,6 +362,30 @@ class DynamicGraphKVEncoder(nn.Module):
         node_idx = node_idx.clamp(min=0, max=node_embeddings.size(1) - 1)
         gather_idx = node_idx.unsqueeze(-1).expand(-1, -1, node_embeddings.size(-1))
         return torch.gather(node_embeddings, dim=1, index=gather_idx)
+
+    @staticmethod
+    def _edge_matrix(state, name: str, *, B: int, device, dtype):
+        edge = state.states.get(name, None)
+        if edge is None:
+            return None
+        edge = edge.to(device=device, dtype=dtype)
+        if edge.dim() == 2:
+            edge = edge.unsqueeze(0)
+        if edge.size(0) == 1 and B != 1:
+            edge = edge.expand(B, -1, -1)
+        return edge
+
+    @staticmethod
+    def _gather_edge_from_current(edge_matrix, current_node_idx):
+        B, T = current_node_idx.shape
+        batch_idx = torch.arange(B, device=edge_matrix.device).view(B, 1).expand(B, T)
+        return edge_matrix[batch_idx, current_node_idx, :]
+
+    @staticmethod
+    def _gather_edge_to_depot(edge_matrix, current_node_idx):
+        B, T = current_node_idx.shape
+        batch_idx = torch.arange(B, device=edge_matrix.device).view(B, 1).expand(B, T)
+        return edge_matrix[batch_idx, current_node_idx, 0].unsqueeze(-1)
 
     def _node_type_masks(self, state, node_embeddings, T):
         B, N, _ = node_embeddings.shape
@@ -430,34 +514,41 @@ class DynamicGraphKVEncoder(nn.Module):
             index=current_node_idx.unsqueeze(-1).expand(-1, -1, node_loc.size(-1)),
         )
         rel = node_loc.to(device=device, dtype=dtype).unsqueeze(1) - current_loc.unsqueeze(2)
-        travel_proxy = torch.linalg.norm(rel, dim=-1).clamp(min=0.0) / (2.0 ** 0.5)
+        coord_travel_proxy = torch.linalg.norm(rel, dim=-1).clamp(min=0.0) / (2.0 ** 0.5)
         depot_step_loc = node_loc[:, :1, :].to(device=device, dtype=dtype)
-        return_to_depot = torch.linalg.norm(
+        coord_return_to_depot = torch.linalg.norm(
             node_loc.to(device=device, dtype=dtype).unsqueeze(1)
             - depot_step_loc.unsqueeze(2),
             dim=-1,
         ).clamp(min=0.0) / (2.0 ** 0.5)
-        if return_to_depot.size(1) == 1 and T != 1:
-            return_to_depot = return_to_depot.expand(-1, T, -1)
-        current_to_depot = torch.linalg.norm(
+        if coord_return_to_depot.size(1) == 1 and T != 1:
+            coord_return_to_depot = coord_return_to_depot.expand(-1, T, -1)
+        coord_current_to_depot = torch.linalg.norm(
             current_loc - depot_step_loc,
             dim=-1,
             keepdim=True,
         ).clamp(min=0.0) / (2.0 ** 0.5)
+        travel_proxy = coord_travel_proxy
+        return_to_depot = coord_return_to_depot
+        current_to_depot = coord_current_to_depot
+
+        edge_distance = self._edge_matrix(state, "edge_distance", B=B, device=device, dtype=dtype)
+        if edge_distance is not None:
+            travel_proxy = self._gather_edge_from_current(edge_distance, current_node_idx)
+            return_to_depot = edge_distance[:, None, :, 0].expand(-1, T, -1)
+            current_to_depot = self._gather_edge_to_depot(edge_distance, current_node_idx)
         depot_detour = travel_proxy + return_to_depot - current_to_depot
 
-        edge_energy = state.states.get("edge_energy", None)
+        edge_energy = self._edge_matrix(state, "edge_energy", B=B, device=device, dtype=dtype)
         if edge_energy is None:
             energy_cost = travel_proxy
         else:
-            edge_energy = edge_energy.to(device=device, dtype=dtype)
-            if edge_energy.dim() == 2:
-                edge_energy = edge_energy.unsqueeze(0)
-            if edge_energy.size(0) == 1 and B != 1:
-                edge_energy = edge_energy.expand(B, -1, -1)
-            edge_energy = edge_energy.unsqueeze(1).expand(-1, T, -1, -1)
-            gather_idx = current_node_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, N)
-            energy_cost = torch.gather(edge_energy, dim=2, index=gather_idx).squeeze(2)
+            energy_cost = self._gather_edge_from_current(edge_energy, current_node_idx)
+        edge_time = self._edge_matrix(state, "edge_time", B=B, device=device, dtype=dtype)
+        if edge_time is None:
+            travel_time = coord_travel_proxy
+        else:
+            travel_time = self._gather_edge_from_current(edge_time, current_node_idx)
 
         time_window = state.states["time_window"].to(device=device, dtype=dtype)
         service_time = state.states["service_time"].to(device=device, dtype=dtype)
@@ -476,7 +567,7 @@ class DynamicGraphKVEncoder(nn.Module):
         current_load = self._as_step_scalar(state.used_capacity.float(), T, node_embeddings)
         current_battery = self._as_step_scalar(state.used_battery.float(), T, node_embeddings)
 
-        arrival = current_time + travel_proxy
+        arrival = current_time + travel_time
         wait = torch.relu(tw_open - arrival)
         service_start = torch.maximum(arrival, tw_open)
         finish = service_start + service
@@ -621,6 +712,11 @@ class DynamicGraphKVEncoder(nn.Module):
             route_mask,
             weights=1.0 + route_order,
         )
+        route_summary = route_summary + self._route_position_summary(
+            node_embeddings,
+            route_mask,
+            route_order,
+        )
         feasible_customer = action_mask & customer_mask
         feasible_rs = action_mask & rs_mask
         unvisited_customer = customer_mask & (visit_count <= 0)
@@ -686,16 +782,37 @@ class DynamicGraphKVEncoder(nn.Module):
             current_node_idx=current_node_idx,
             prev_node_idx=prev_node_idx,
         )
-        candidate_delta = self.candidate_feature_proj(candidate_features)
-        candidate_delta = candidate_delta + self.node_state_proj(node_embeddings).unsqueeze(1)
-        candidate_delta = candidate_delta + self.decision_state_proj(decision_token).unsqueeze(2)
-        candidate_delta = candidate_delta + self.step_state_proj(state_token).unsqueeze(2)
-        key_delta, value_delta, action_key_delta = candidate_delta.chunk(3, dim=-1)
-        action_bias = self.action_bias_proj(candidate_features).squeeze(-1)
-        key_delta = torch.tanh(self.key_scale) * key_delta
-        value_delta = torch.tanh(self.value_scale) * value_delta
-        action_key_delta = torch.tanh(self.action_key_scale) * action_key_delta
-        action_bias = torch.tanh(self.action_bias_scale) * action_bias
+        key_delta = 0
+        value_delta = 0
+        action_key_delta = 0
+        if self.enable_delta_k or self.enable_delta_v or self.enable_delta_action_key:
+            candidate_base = self.candidate_delta_base(candidate_features)
+            node_key, node_value, node_action_key = self.node_state_proj(node_embeddings).chunk(3, dim=-1)
+            decision_key, decision_value, decision_action_key = self.decision_state_proj(decision_token).chunk(3, dim=-1)
+            step_key, step_value, step_action_key = self.step_state_proj(state_token).chunk(3, dim=-1)
+            if self.enable_delta_k:
+                key_delta = self.candidate_key_delta_proj(candidate_base)
+                key_delta = key_delta + node_key.unsqueeze(1)
+                key_delta = key_delta + decision_key.unsqueeze(2)
+                key_delta = key_delta + step_key.unsqueeze(2)
+                key_delta = torch.tanh(self.key_scale) * key_delta
+            if self.enable_delta_v:
+                value_delta = self.candidate_value_delta_proj(candidate_base)
+                value_delta = value_delta + node_value.unsqueeze(1)
+                value_delta = value_delta + decision_value.unsqueeze(2)
+                value_delta = value_delta + step_value.unsqueeze(2)
+                value_delta = torch.tanh(self.value_scale) * value_delta
+            if self.enable_delta_action_key:
+                action_key_delta = self.candidate_action_key_delta_proj(candidate_base)
+                action_key_delta = action_key_delta + node_action_key.unsqueeze(1)
+                action_key_delta = action_key_delta + decision_action_key.unsqueeze(2)
+                action_key_delta = action_key_delta + step_action_key.unsqueeze(2)
+                action_key_delta = torch.tanh(self.action_key_scale) * action_key_delta
+        if self.enable_action_bias:
+            action_bias = self.action_bias_proj(candidate_features).squeeze(-1)
+            action_bias = torch.tanh(self.action_bias_scale) * action_bias
+        else:
+            action_bias = 0
         return key_delta, value_delta, action_key_delta, action_bias
 
 
@@ -724,6 +841,10 @@ class Decoder(nn.Module):
         tanh_clipping,
         use_dynamic_decision_encoder=False,
         dynamic_decision_heads=4,
+        dynamic_decision_delta_k=True,
+        dynamic_decision_delta_v=True,
+        dynamic_decision_delta_action_key=True,
+        dynamic_decision_action_bias=True,
     ):
         super().__init__()
 
@@ -748,6 +869,10 @@ class Decoder(nn.Module):
             embedding_dim=embedding_dim,
             n_heads=dynamic_decision_heads,
             enabled=use_dynamic_decision_encoder,
+            enable_delta_k=dynamic_decision_delta_k,
+            enable_delta_v=dynamic_decision_delta_v,
+            enable_delta_action_key=dynamic_decision_delta_action_key,
+            enable_action_bias=dynamic_decision_action_bias,
         )
 
         # glimpse + pointer
@@ -832,26 +957,43 @@ class Decoder(nn.Module):
             state=state,
         )
 
-        has_stepwise_candidate_delta = torch.is_tensor(key_delta) and key_delta.dim() == 4
+        tensor_deltas = [
+            delta
+            for delta in (key_delta, val_delta, action_key_delta)
+            if torch.is_tensor(delta)
+        ]
+        stepwise_t = 1
+        for delta in tensor_deltas:
+            if delta.dim() == 4:
+                stepwise_t = max(stepwise_t, int(delta.size(1)))
+        if stepwise_t > 1:
+            glimpse_K = glimpse_K.unsqueeze(1).expand(-1, stepwise_t, -1, -1)
+            glimpse_V = glimpse_V.unsqueeze(1).expand(-1, stepwise_t, -1, -1)
+            action_key = action_key.unsqueeze(1).expand(-1, stepwise_t, -1, -1)
 
-        if has_stepwise_candidate_delta:
-            glimpse_K = glimpse_K.unsqueeze(1)
-            glimpse_V = glimpse_V.unsqueeze(1)
-            action_key = action_key.unsqueeze(1)
-            if key_delta.dim() == 3:
-                key_delta = key_delta.unsqueeze(1)
-                val_delta = val_delta.unsqueeze(1)
-                action_key_delta = action_key_delta.unsqueeze(1)
-            glimpse_K = glimpse_K + key_delta
-            glimpse_V = glimpse_V + val_delta
-            action_key = action_key + action_key_delta
-        elif torch.is_tensor(key_delta):
-            key_delta = key_delta.squeeze(1)
-            val_delta = val_delta.squeeze(1)
-            action_key_delta = action_key_delta.squeeze(1)
-            glimpse_K = glimpse_K + key_delta
-            glimpse_V = glimpse_V + val_delta
-            action_key = action_key + action_key_delta
+            def _align_stepwise(delta):
+                if not torch.is_tensor(delta):
+                    return None
+                if delta.dim() == 3:
+                    return delta.unsqueeze(1).expand(-1, stepwise_t, -1, -1)
+                return delta
+
+            aligned_key_delta = _align_stepwise(key_delta)
+            aligned_val_delta = _align_stepwise(val_delta)
+            aligned_action_key_delta = _align_stepwise(action_key_delta)
+            if aligned_key_delta is not None:
+                glimpse_K = glimpse_K + aligned_key_delta
+            if aligned_val_delta is not None:
+                glimpse_V = glimpse_V + aligned_val_delta
+            if aligned_action_key_delta is not None:
+                action_key = action_key + aligned_action_key_delta
+        elif tensor_deltas:
+            if torch.is_tensor(key_delta):
+                glimpse_K = glimpse_K + key_delta.squeeze(1) if key_delta.dim() == 4 else glimpse_K + key_delta
+            if torch.is_tensor(val_delta):
+                glimpse_V = glimpse_V + val_delta.squeeze(1) if val_delta.dim() == 4 else glimpse_V + val_delta
+            if torch.is_tensor(action_key_delta):
+                action_key = action_key + action_key_delta.squeeze(1) if action_key_delta.dim() == 4 else action_key + action_key_delta
 
         # base feasibility mask from env, over real nodes only
         mask = state.get_mask()   # [B,N]

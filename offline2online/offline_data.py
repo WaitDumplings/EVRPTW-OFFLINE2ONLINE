@@ -13,15 +13,15 @@ from .integrations.evrptw_db import configure_evrptw_db
 
 EVRPTW_DB_ROOT = configure_evrptw_db()
 
-from evrptw_core.io import iter_instances
 from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.env_factory import make_terran_env
 from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.rollout import stack_observations
+from evrptw_core.io import iter_instances
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-@dataclass(frozen=True)
+@dataclass
 class ExpertRecord:
     instance_id: str
     instance: Any
@@ -45,40 +45,62 @@ class ExpertTrajectory:
 
 def resolve_repo_path(path: str | Path) -> Path:
     out = Path(path)
-    return out if out.is_absolute() else EVRPTW_DB_ROOT / out
+    if out.is_absolute():
+        return out
+    if str(path).startswith("EVRPTW_DB_ROOT/"):
+        return EVRPTW_DB_ROOT / str(path).split("/", 1)[1]
+    return REPO_ROOT / out
+
+
+def _route_payload(row: dict[str, str]) -> str:
+    for key in ("routes_json", "routes", "route_json", "solution_routes"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _parse_routes(payload: str) -> list[list[int]]:
+    data = json.loads(payload)
+    if isinstance(data, dict):
+        for key in ("routes", "solution", "vehicles"):
+            if key in data:
+                data = data[key]
+                break
+    routes: list[list[int]] = []
+    for route in data:
+        if isinstance(route, dict):
+            route = route.get("route") or route.get("nodes") or route.get("path") or []
+        nodes = [int(node) for node in route]
+        if nodes:
+            routes.append(nodes)
+    return routes
+
+
+def _clean_routes(routes: Sequence[Sequence[int]]) -> list[list[int]]:
+    clean: list[list[int]] = []
+    for route in routes:
+        nodes = [int(node) for node in route]
+        if not nodes or not any(node != 0 for node in nodes):
+            continue
+        if nodes[0] != 0:
+            nodes.insert(0, 0)
+        if nodes[-1] != 0:
+            nodes.append(0)
+        clean.append(nodes)
+    return clean
 
 
 def route_actions(routes: Sequence[Sequence[int]]) -> list[int]:
     actions: list[int] = []
-    for route in routes:
-        route_list = [int(x) for x in route]
-        if len(route_list) < 2:
-            continue
-        if route_list[0] != 0:
-            raise ValueError(f"expert route must start at depot 0, got {route_list}")
-        actions.extend(route_list[1:])
+    for route in _clean_routes(routes):
+        actions.extend(int(node) for node in route[1:])
     return actions
-
-
-def _parse_routes(raw: str) -> list[list[int]]:
-    routes = json.loads(raw)
-    if not routes:
-        return []
-    if isinstance(routes[0], (int, float, str)):
-        return [[int(node) for node in routes]]
-    return [[int(node) for node in route] for route in routes]
-
-
-def _route_payload(row: dict[str, str]) -> str:
-    return str(row.get("routes_json") or row.get("route_sequence_json") or "")
 
 
 def _is_usable_solution(row: dict[str, str]) -> bool:
     status = str(row.get("status", "")).strip().upper()
     status_name = str(row.get("status_name", "")).strip().upper()
-    # Empty status is allowed for generic solver/heuristic archives. Gurobi may
-    # use numeric status 2, while checkpoint traces often store RUNNING with an
-    # incumbent.
     allowed = {"2", "9", "OPTIMAL", "TIME_LIMIT", "RUNNING", "SUBOPTIMAL", "FEASIBLE", "SUCCESS", "OK"}
     status_ok = not status or status in allowed or status_name in allowed
     if not status_ok:
@@ -141,7 +163,6 @@ def load_solver_expert_records(
     return records
 
 
-# Backward-compatible alias for older configs and scripts.
 load_gurobi_expert_records = load_solver_expert_records
 
 
@@ -151,25 +172,31 @@ def build_expert_trajectories(
     *,
     max_records: int | None = None,
     strict: bool = True,
+    seed: int = 0,
 ) -> tuple[list[ExpertTrajectory], dict[str, Any]]:
+    del seed
     env_cfg = dict(cfg.get("env", {}) or {})
     env_cfg["use_fast_env"] = True
     env_cfg.setdefault("info_level", "light")
+    scale_mode = str(env_cfg.get("reward_distance_scale_mode", ""))
+    if scale_mode.startswith("dataset_"):
+        env_cfg["reward_distance_scale_mode"] = scale_mode[len("dataset_") :]
+
+    selected = list(records[: max_records or len(records)])
     trajectories: list[ExpertTrajectory] = []
     invalid_records: list[dict[str, Any]] = []
-    selected_records = list(records[: max_records or len(records)])
-    for record in selected_records:
-        env = make_terran_env(
-            instance=record.instance,
-            n_traj=1,
-            pbrs_config=None,
-            **env_cfg,
-        )
+    objective_errors: list[float] = []
+    route_counts: list[int] = []
+
+    for record in selected:
+        clean_routes = _clean_routes(record.routes)
+        route_counts.append(len(clean_routes))
+        env = make_terran_env(instance=record.instance, n_traj=1, pbrs_config=None, **env_cfg)
         obs, info = env.reset()
         observations: list[dict[str, np.ndarray]] = []
         actions: list[int] = []
         invalid_step: dict[str, Any] | None = None
-        for step_idx, action in enumerate(route_actions(record.routes)):
+        for step_idx, action in enumerate(route_actions(clean_routes)):
             action_i = int(action)
             mask = np.asarray(obs["action_mask"], dtype=bool)
             if mask.shape[0] != 1 or action_i < 0 or action_i >= mask.shape[1] or not bool(mask[0, action_i]):
@@ -203,6 +230,9 @@ def build_expert_trajectories(
             )
             continue
         if actions:
+            objective = np.asarray(info.get("objective_distance_km", []), dtype=np.float64).reshape(-1)
+            if objective.size > 0 and np.isfinite(objective[0]):
+                objective_errors.append(abs(float(objective[0]) - float(record.objective_distance_km)))
             trajectories.append(
                 ExpertTrajectory(
                     instance_id=record.instance_id,
@@ -213,32 +243,42 @@ def build_expert_trajectories(
                 )
             )
     if strict and invalid_records:
-        first = invalid_records[0]
-        raise ValueError(f"{len(invalid_records)} expert routes failed replay; first={first}")
+        raise ValueError(f"{len(invalid_records)} expert routes failed replay; first={invalid_records[0]}")
     stats = {
-        "records_seen": len(selected_records),
+        "records_seen": len(selected),
         "trajectories": len(trajectories),
         "invalid_records": len(invalid_records),
         "steps": int(sum(traj.length for traj in trajectories)),
         "avg_steps_per_route": float(np.mean([traj.length for traj in trajectories])) if trajectories else 0.0,
+        "expert_replay_success_rate": float(len(trajectories) / max(len(selected), 1)),
+        "expert_action_valid_ratio": float(1.0 - len(invalid_records) / max(len(selected), 1)),
+        "expert_env_replay_obj_error_mean": float(np.mean(objective_errors)) if objective_errors else float("nan"),
+        "expert_env_replay_obj_error_max": float(np.max(objective_errors)) if objective_errors else float("nan"),
+        "expert_route_count_mean": float(np.mean(route_counts)) if route_counts else 0.0,
     }
     return trajectories, stats
 
 
 class ExpertReplayBuffer:
-    def __init__(self, trajectories: Sequence[ExpertTrajectory], seed: int = 0) -> None:
+    def __init__(
+        self,
+        trajectories: Sequence[ExpertTrajectory],
+        seed: int = 0,
+        replay_stats: dict[str, Any] | None = None,
+    ) -> None:
         self.trajectories = list(trajectories)
         if not self.trajectories:
             raise ValueError("ExpertReplayBuffer requires at least one trajectory")
+        self.rng = np.random.default_rng(int(seed))
+        self.replay_stats = dict(replay_stats or {})
         self.objective_by_instance_id = {
-            traj.instance_id: float(traj.objective_distance_km)
+            str(traj.instance_id): float(traj.objective_distance_km)
             for traj in self.trajectories
         }
         self.trajectory_by_instance_id = {
-            traj.instance_id: traj
+            str(traj.instance_id): traj
             for traj in self.trajectories
         }
-        self.rng = np.random.default_rng(int(seed))
         self._step_index: list[tuple[int, int]] = [
             (traj_idx, step_idx)
             for traj_idx, traj in enumerate(self.trajectories)
@@ -267,33 +307,27 @@ class ExpertReplayBuffer:
         return self.trajectory_by_instance_id.get(str(instance_id))
 
     def sample_step_batch(self, batch_size: int) -> tuple[dict[str, np.ndarray], torch.Tensor]:
+        obs_batch, action_tensor, _ = self.sample_step_batch_with_objectives(batch_size)
+        return obs_batch, action_tensor
+
+    def sample_step_batch_with_objectives(
+        self,
+        batch_size: int,
+    ) -> tuple[dict[str, np.ndarray], torch.Tensor, torch.Tensor]:
         indices = self.rng.integers(0, len(self._step_index), size=max(1, int(batch_size)))
         observations = []
         actions = []
+        objectives = []
         for index in indices:
             traj_idx, step_idx = self._step_index[int(index)]
             traj = self.trajectories[traj_idx]
             observations.append(traj.observations[step_idx])
             actions.append(traj.actions[step_idx])
+            objectives.append(float(traj.objective_distance_km))
         obs_batch = stack_observations(observations)
         action_tensor = torch.as_tensor(np.asarray(actions, dtype=np.int64)[:, None], dtype=torch.long)
-        return obs_batch, action_tensor
-
-    def sample_route_batch(self, batch_size: int) -> tuple[dict[str, np.ndarray], torch.Tensor, torch.Tensor]:
-        traj_indices = self.rng.integers(0, len(self.trajectories), size=max(1, int(batch_size)))
-        observations = []
-        actions = []
-        route_ids = []
-        for local_route_idx, traj_index in enumerate(traj_indices):
-            traj = self.trajectories[int(traj_index)]
-            for obs, action in zip(traj.observations, traj.actions):
-                observations.append(obs)
-                actions.append(action)
-                route_ids.append(local_route_idx)
-        obs_batch = stack_observations(observations)
-        action_tensor = torch.as_tensor(np.asarray(actions, dtype=np.int64)[:, None], dtype=torch.long)
-        route_tensor = torch.as_tensor(np.asarray(route_ids, dtype=np.int64), dtype=torch.long)
-        return obs_batch, action_tensor, route_tensor
+        objective_tensor = torch.as_tensor(np.asarray(objectives, dtype=np.float32), dtype=torch.float32)
+        return obs_batch, action_tensor, objective_tensor
 
 
 def compute_bc_loss(agent, buffer: ExpertReplayBuffer, batch_size: int, device: str | torch.device):
@@ -310,29 +344,68 @@ def compute_bc_loss(agent, buffer: ExpertReplayBuffer, batch_size: int, device: 
     return loss, {
         "bc_loss": float(loss.detach().cpu().item()),
         "bc_accuracy": float(acc.detach().cpu().item()),
+        "bc_action_accuracy": float(acc.detach().cpu().item()),
         "bc_entropy": float(entropy_flat.mean().detach().cpu().item()),
         "bc_steps": int(action.numel()),
     }
 
 
-def compute_route_supervised_loss(agent, buffer: ExpertReplayBuffer, batch_size: int, device: str | torch.device):
-    obs_batch, action, route_id = buffer.sample_route_batch(batch_size)
+def compute_awbc_loss(
+    agent,
+    buffer: ExpertReplayBuffer,
+    batch_size: int,
+    device: str | torch.device,
+    *,
+    eta: float = 0.05,
+    normalize: str = "p95",
+    baseline: str = "batch_mean",
+    baseline_objective: float | None = None,
+):
+    obs_batch, action, objective = buffer.sample_step_batch_with_objectives(batch_size)
     action = action.to(device)
-    route_id = route_id.to(device)
+    objective = objective.to(device)
     _, logprob, entropy, _ = agent.get_action_and_value(obs_batch, action=action)
     logprob_flat = logprob.reshape(-1)
     entropy_flat = entropy.reshape(-1)
-    num_routes = int(route_id.max().detach().cpu().item()) + 1 if route_id.numel() else 0
-    route_logprob_sum = torch.zeros(num_routes, dtype=logprob_flat.dtype, device=logprob_flat.device)
-    route_len = torch.zeros(num_routes, dtype=logprob_flat.dtype, device=logprob_flat.device)
-    route_logprob_sum.scatter_add_(0, route_id, logprob_flat)
-    route_len.scatter_add_(0, route_id, torch.ones_like(logprob_flat))
-    route_mean_logprob = route_logprob_sum / route_len.clamp_min(1.0)
-    loss = -route_mean_logprob.mean()
+    obj_flat = objective.reshape(-1).to(logprob_flat.dtype)
+
+    with torch.no_grad():
+        if baseline_objective is not None and np.isfinite(float(baseline_objective)):
+            base = torch.as_tensor(float(baseline_objective), dtype=obj_flat.dtype, device=obj_flat.device)
+        elif baseline == "batch_median":
+            base = torch.quantile(obj_flat, 0.5)
+        elif baseline == "batch_p75":
+            base = torch.quantile(obj_flat, 0.75)
+        elif baseline == "batch_p90":
+            base = torch.quantile(obj_flat, 0.90)
+        else:
+            base = obj_flat.mean()
+        adv_pos = torch.clamp(base - obj_flat, min=0.0)
+        positive = adv_pos[adv_pos > 0]
+        if normalize == "eta_objective":
+            denom = torch.clamp(float(eta) * obj_flat.abs(), min=1e-8)
+            weights = torch.clamp(adv_pos / denom, 0.0, 1.0)
+        elif positive.numel() > 0:
+            q = torch.quantile(positive, 0.95)
+            weights = torch.clamp(adv_pos / torch.clamp(q, min=1e-8), 0.0, 1.0)
+        else:
+            weights = torch.zeros_like(adv_pos)
+    denom = weights.sum().clamp_min(1.0)
+    loss = -(weights * logprob_flat).sum() / denom
+    with torch.no_grad():
+        _, logits = agent(obs_batch)
+        pred_action = logits.reshape(-1, logits.size(-1)).argmax(dim=-1)
+        acc = (pred_action == action.reshape(-1)).float().mean()
+        active = weights > 0
     return loss, {
-        "sl_route_loss": float(loss.detach().cpu().item()),
-        "sl_route_entropy": float(entropy_flat.mean().detach().cpu().item()),
-        "sl_route_count": int(num_routes),
-        "sl_step_count": int(action.numel()),
-        "sl_avg_route_len": float(route_len.mean().detach().cpu().item()) if num_routes else 0.0,
+        "bc_loss": float(loss.detach().cpu().item()),
+        "bc_accuracy": float(acc.detach().cpu().item()),
+        "bc_action_accuracy": float(acc.detach().cpu().item()),
+        "bc_entropy": float(entropy_flat.mean().detach().cpu().item()),
+        "bc_steps": int(action.numel()),
+        "awbc_loss": float(loss.detach().cpu().item()),
+        "awbc_weight_mean": float(weights.mean().detach().cpu().item()),
+        "awbc_weight_std": float(weights.std(unbiased=False).detach().cpu().item()),
+        "awbc_active_ratio": float(active.float().mean().detach().cpu().item()),
+        "awbc_expert_better_ratio": float(active.float().mean().detach().cpu().item()),
     }

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from collections import deque
 from contextlib import nullcontext
 import csv
 from dataclasses import dataclass
+import itertools
 import json
+import math
+import os
 from pathlib import Path
 import random
 import time
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -22,13 +26,18 @@ from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.env_factory import make_terr
 from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.rollout import (
     collect_rollout,
     compute_returns,
+    reset_envs,
     sample_actions,
     stack_observations,
+    step_envs,
 )
 from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.trainer import (
     _debug_log,
     _format_float,
     _slice_obs_by_env,
+    _configure_dataset_reward_scale,
+    build_pbrs_config,
+    FixedDatasetInstancePool,
     evaluate_fixed_dataset,
     evaluate_policy_loss,
     make_envs,
@@ -36,13 +45,14 @@ from EVRPTW_Benchmark.Reinforcement_Learning.TERRAN.trainer import (
     set_pbrs_reward_scale,
     summarize_train_infos,
 )
+from evrptw_core.io import iter_instances
 
 from .models import Agent
 from .offline_data import (
     ExpertReplayBuffer,
     build_expert_trajectories,
+    compute_awbc_loss,
     compute_bc_loss,
-    compute_route_supervised_loss,
     load_solver_expert_records,
 )
 
@@ -148,33 +158,39 @@ def _offline_method(cfg: dict[str, Any]) -> str:
 
 
 def _is_sl_ppo_method(method: str) -> bool:
-    return method in {"sl_ppo", "sl-ppo", "slppo"}
+    return False
 
 
 def _is_frro_method(method: str) -> bool:
-    return method in {"frro", "frro_ppo", "frro-ppo", "sl_frro", "sl-frro"}
+    return False
 
 
 def _is_dapg_method(method: str) -> bool:
-    return method in {"dapg", "bc_dapg", "bc+ppo", "gadapg", "ga_dapg", "ga-dapg", "group_dapg", "group-dapg"}
+    return method in {"dapg"}
+
+
+def _is_awbc_method(method: str) -> bool:
+    return method in {"awbc", "awbc_ppo", "awbc-ppo", "advantage_weighted_bc", "advantage-weighted-bc"}
+
+
+def _is_hard_method(method: str) -> bool:
+    return False
+
+
+def _is_hard_full_method(method: str) -> bool:
+    return False
+
+
+def _is_bc_aux_method(method: str) -> bool:
+    return False
 
 
 def _is_bafipo_method(method: str) -> bool:
-    return method in {"bafipo", "ba_fipo", "ba-fipo", "branch_aware_fipo", "branch-aware-fipo"}
+    return False
 
 
 def _is_gcbpo_method(method: str) -> bool:
-    return method in {
-        "gcbpo",
-        "gcbpo_branch",
-        "gcbpo-branch",
-        "gcbpo_prefix",
-        "gcbpo-prefix",
-        "gcbpo_branch_pref",
-        "gcbpo-branch-pref",
-        "gcbpo_branch_prefix",
-        "gcbpo-branch-prefix",
-    }
+    return False
 
 
 def _is_solution_level_method(method: str) -> bool:
@@ -182,17 +198,11 @@ def _is_solution_level_method(method: str) -> bool:
 
 
 def _is_route_bc_method(method: str) -> bool:
-    return method in {"route_bc_ppo", "route-bc-ppo", "route_bc", "route-bc", "route_sl_ppo"}
+    return False
 
 
 def _requires_expert_routes(method: str) -> bool:
-    return (
-        method in {"bc_ppo", "bc-ppo"}
-        or _is_dapg_method(method)
-        or _is_bafipo_method(method)
-        or _is_gcbpo_method(method)
-        or _is_route_bc_method(method)
-    )
+    return method in {"bc_ppo", "bc-ppo"} or _is_dapg_method(method) or _is_awbc_method(method)
 
 
 def _offline_coef(offline_cfg: dict[str, Any], epoch: int) -> float:
@@ -205,121 +215,19 @@ def _offline_coef(offline_cfg: dict[str, Any], epoch: int) -> float:
 
 
 def _advantage_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    adv_cfg = dict(cfg.get("advantage", {}) or {})
-    offline_cfg = cfg.get("offline", {}) or {}
-    method = _offline_method(cfg)
-    for key in (
-        "use_group_advantage",
-        "group_adv_coef",
-        "group_adv_clip",
-        "group_adv_std_floor",
-        "group_infeasible_penalty",
-        "use_reference_advantage",
-        "reference_advantage_mode",
-        "reference_adv_coef",
-        "reference_adv_rho",
-        "reference_adv_clip",
-        "reference_success_only",
-        "reference_gap_baseline",
-        "reference_gap_floor_ratio",
-        "use_reference_soft_gate",
-        "reference_soft_gate_eta",
-        "reference_policy_estimate",
-        "use_reference_memory_gate",
-        "reference_memory_gate_eta",
-        "reference_memory_margin",
-        "use_frro",
-        "frro_coef",
-        "frro_advantage_mode",
-        "frro_gap_baseline",
-        "frro_gap_floor_ratio",
-        "frro_gap_scale_coef",
-        "frro_std_floor",
-        "frro_rho",
-        "frro_clip",
-        "frro_success_only",
-        "frro_positive_coef",
-        "frro_negative_coef",
-        "frro_quality_gate_eta",
-        "frro_falsification_margin",
-        "frro_falsification_eta",
-        "frro_use_memory_falsification",
-        "frro_use_current_falsification",
-        "frro_use_expert_candidate",
-        "frro_expert_candidate_weight",
-        "frro_expert_logprob_chunk_size",
-        "frro_use_support_gate",
-        "frro_support_logprob_min",
-        "frro_support_gate_temperature",
-        "renormalize_after_aux_advantage",
-    ):
-        if key in offline_cfg and key not in adv_cfg:
-            adv_cfg[key] = offline_cfg[key]
-    if _is_solution_level_method(method):
-        adv_cfg.setdefault("use_reference_advantage", True)
-        adv_cfg.setdefault("reference_adv_coef", 0.10)
-        adv_cfg.setdefault("reference_advantage_mode", "absolute")
-        adv_cfg.setdefault("reference_adv_rho", 0.10)
-        adv_cfg.setdefault("reference_adv_clip", 2.0)
-        adv_cfg.setdefault("reference_success_only", True)
-        adv_cfg.setdefault("reference_gap_baseline", "mean")
-        adv_cfg.setdefault("reference_gap_floor_ratio", 0.01)
-        adv_cfg.setdefault("use_reference_soft_gate", True)
-        adv_cfg.setdefault("reference_soft_gate_eta", 0.05)
-        adv_cfg.setdefault("reference_policy_estimate", "best")
-    if method in {"gadapg", "ga_dapg", "ga-dapg", "group_dapg", "group-dapg"}:
-        adv_cfg.setdefault("use_group_advantage", True)
-        adv_cfg.setdefault("group_adv_coef", 0.30)
-        adv_cfg.setdefault("group_adv_clip", 3.0)
-        adv_cfg.setdefault("group_adv_std_floor", 5.0)
-        adv_cfg.setdefault("renormalize_after_aux_advantage", True)
-    if _is_frro_method(method):
-        adv_cfg["use_reference_advantage"] = False
-        adv_cfg["reference_adv_coef"] = 0.0
-        adv_cfg.setdefault("use_group_advantage", True)
-        adv_cfg.setdefault("group_adv_coef", 0.30)
-        adv_cfg.setdefault("group_adv_clip", 3.0)
-        adv_cfg.setdefault("group_adv_std_floor", 5.0)
-        adv_cfg.setdefault("use_frro", True)
-        adv_cfg.setdefault("frro_coef", 0.10)
-        adv_cfg.setdefault("frro_advantage_mode", "remaining_gap")
-        adv_cfg.setdefault("frro_gap_baseline", "mean")
-        adv_cfg.setdefault("frro_gap_floor_ratio", 0.01)
-        adv_cfg.setdefault("frro_gap_scale_coef", 1.0)
-        adv_cfg.setdefault("frro_std_floor", 5.0)
-        adv_cfg.setdefault("frro_rho", 0.10)
-        adv_cfg.setdefault("frro_clip", 2.0)
-        adv_cfg.setdefault("frro_success_only", True)
-        adv_cfg.setdefault("frro_positive_coef", 1.0)
-        adv_cfg.setdefault("frro_negative_coef", 1.0)
-        adv_cfg.setdefault("frro_quality_gate_eta", 0.05)
-        adv_cfg.setdefault("frro_falsification_margin", 0.005)
-        adv_cfg.setdefault("frro_falsification_eta", 0.05)
-        adv_cfg.setdefault("frro_use_memory_falsification", True)
-        adv_cfg.setdefault("frro_use_current_falsification", True)
-        adv_cfg.setdefault("frro_use_expert_candidate", True)
-        adv_cfg.setdefault("frro_expert_candidate_weight", 2.0)
-        adv_cfg.setdefault("frro_expert_logprob_chunk_size", 4096)
-        adv_cfg.setdefault("frro_use_support_gate", False)
-        adv_cfg.setdefault("frro_support_logprob_min", -20.0)
-        adv_cfg.setdefault("frro_support_gate_temperature", 1.0)
-    return adv_cfg
+    return dict(cfg.get("advantage", {}) or {})
 
 
 def _group_advantage_enabled(cfg: dict[str, Any]) -> bool:
-    adv_cfg = _advantage_config(cfg)
-    return bool(adv_cfg.get("use_group_advantage", False)) or float(adv_cfg.get("group_adv_coef", 0.0) or 0.0) != 0.0
+    return False
 
 
 def _reference_advantage_enabled(cfg: dict[str, Any]) -> bool:
-    adv_cfg = _advantage_config(cfg)
-    return bool(adv_cfg.get("use_reference_advantage", False)) or float(adv_cfg.get("reference_adv_coef", 0.0) or 0.0) != 0.0
+    return False
 
 
 def _frro_enabled(cfg: dict[str, Any]) -> bool:
-    method = _offline_method(cfg)
-    adv_cfg = _advantage_config(cfg)
-    return _is_frro_method(method) or bool(adv_cfg.get("use_frro", False))
+    return False
 
 
 def _env_instance_id(env) -> str | None:
@@ -356,6 +264,716 @@ def _final_info_arrays(final_infos: list[dict[str, Any]], num_envs: int, n_traj:
         if limit > 0:
             served[env_idx, :limit] = srv_arr[:limit]
     return objective, success, served
+
+
+def _final_vehicle_array(final_infos: list[dict[str, Any]], num_envs: int, n_traj: int) -> np.ndarray:
+    vehicle = np.full((num_envs, n_traj), np.nan, dtype=np.float64)
+    for env_idx, info in enumerate(final_infos[:num_envs]):
+        vehicle_arr = np.asarray(info.get("vehicle_count", []), dtype=np.float64).reshape(-1)
+        limit = min(n_traj, vehicle_arr.size)
+        if limit > 0:
+            vehicle[env_idx, :limit] = vehicle_arr[:limit]
+    return vehicle
+
+
+def _distance_matrix_from_env(env) -> np.ndarray:
+    candidates = [env, getattr(env, "unwrapped", None), getattr(env, "env", None)]
+    current = env
+    for _ in range(8):
+        current = getattr(current, "env", None)
+        if current is None:
+            break
+        candidates.extend([current, getattr(current, "unwrapped", None)])
+    for obj in candidates:
+        instance = getattr(obj, "instance", None) if obj is not None else None
+        if instance is None:
+            continue
+        matrix = getattr(instance, "distance_matrix_km", None)
+        if matrix is None and hasattr(instance, "raw"):
+            matrix = instance.raw.get("distance_matrix_km")
+        if matrix is not None:
+            return np.asarray(matrix, dtype=np.float64)
+    return np.asarray([], dtype=np.float64)
+
+
+def _reward_scale_from_env(env) -> float:
+    candidates = [env, getattr(env, "unwrapped", None), getattr(env, "env", None)]
+    current = env
+    for _ in range(8):
+        current = getattr(current, "env", None)
+        if current is None:
+            break
+        candidates.extend([current, getattr(current, "unwrapped", None)])
+    for obj in candidates:
+        if obj is None:
+            continue
+        scale = getattr(obj, "reward_distance_scale_km", None)
+        if scale is not None:
+            try:
+                return max(float(scale), 1e-9)
+            except (TypeError, ValueError):
+                pass
+    return 1.0
+
+
+def _route_order_distance(order: Sequence[int], dist: np.ndarray) -> float:
+    clean = [int(x) for x in order]
+    if not clean:
+        return 0.0
+    total = float(dist[0, clean[0]])
+    for u, v in zip(clean[:-1], clean[1:]):
+        total += float(dist[int(u), int(v)])
+    total += float(dist[clean[-1], 0])
+    return total
+
+
+def _two_opt_route(order: Sequence[int], dist: np.ndarray, *, max_passes: int) -> list[int]:
+    route = [int(x) for x in order]
+    if len(route) < 4:
+        return route
+    n = len(route)
+    for _ in range(max(0, int(max_passes))):
+        best_delta = -1e-12
+        best_pair: tuple[int, int] | None = None
+        for i in range(n - 1):
+            a = 0 if i == 0 else route[i - 1]
+            b = route[i]
+            for j in range(i + 1, n):
+                c = route[j]
+                d = 0 if j == n - 1 else route[j + 1]
+                delta = float(dist[a, c] + dist[b, d] - dist[a, b] - dist[c, d])
+                if delta < best_delta:
+                    best_delta = delta
+                    best_pair = (i, j)
+        if best_pair is None:
+            break
+        i, j = best_pair
+        route[i : j + 1] = reversed(route[i : j + 1])
+    return route
+
+
+def _nearest_neighbor_route(customers: Sequence[int], dist: np.ndarray, start: int) -> list[int]:
+    unvisited = set(int(c) for c in customers)
+    current = int(start)
+    order = [current]
+    unvisited.remove(current)
+    while unvisited:
+        nxt = min(unvisited, key=lambda c: (float(dist[current, c]), int(c)))
+        order.append(int(nxt))
+        unvisited.remove(int(nxt))
+        current = int(nxt)
+    return order
+
+
+def _load_reference_metrics(path: str | Path | None) -> dict[str, dict[str, float]]:
+    ref_path = _resolve_path(path)
+    if ref_path is None or not ref_path.exists():
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    with ref_path.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            instance_id = str(row.get("instance_id", ""))
+            if not instance_id:
+                continue
+            try:
+                objective = float(row.get("objective_distance_km", "nan"))
+            except (TypeError, ValueError):
+                objective = float("nan")
+            try:
+                vehicle = float(row.get("vehicle_count", "nan"))
+            except (TypeError, ValueError):
+                vehicle = float("nan")
+            feasible_raw = str(row.get("feasible", "")).strip().lower()
+            feasible = feasible_raw in {"true", "1", "yes", "y"} or feasible_raw == ""
+            if feasible and np.isfinite(objective):
+                out[instance_id] = {
+                    "objective_distance_km": objective,
+                    "vehicle_count": vehicle,
+                }
+    return out
+
+
+def _tail_gap_stats(rows: list[dict[str, Any]], references: dict[str, dict[str, float]]) -> dict[str, Any]:
+    gaps: list[float] = []
+    vehicle_gaps: list[float] = []
+    expert_k_gaps: dict[int, list[float]] = {k: [] for k in range(1, 5)}
+    expert_k_objs: dict[int, list[float]] = {k: [] for k in range(1, 5)}
+    policy_k_gaps: dict[int, list[float]] = {k: [] for k in range(1, 5)}
+    policy_k_objs: dict[int, list[float]] = {k: [] for k in range(1, 5)}
+    for row in rows:
+        ref = references.get(str(row.get("instance_id", "")))
+        if ref is None:
+            continue
+        try:
+            policy_obj = float(row.get("objective_distance_km", float("nan")))
+            expert_obj = float(ref.get("objective_distance_km", float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(policy_obj) and np.isfinite(expert_obj)):
+            continue
+        gap = policy_obj - expert_obj
+        gaps.append(float(gap))
+        try:
+            policy_vehicle = float(row.get("vehicle_count", float("nan")))
+            expert_vehicle = float(ref.get("vehicle_count", float("nan")))
+        except (TypeError, ValueError):
+            policy_vehicle = float("nan")
+            expert_vehicle = float("nan")
+        if np.isfinite(policy_vehicle) and np.isfinite(expert_vehicle):
+            vehicle_gaps.append(float(policy_vehicle - expert_vehicle))
+            expert_bucket = min(max(int(round(expert_vehicle)), 1), 4)
+            policy_bucket = min(max(int(round(policy_vehicle)), 1), 4)
+            expert_k_gaps[expert_bucket].append(float(gap))
+            expert_k_objs[expert_bucket].append(float(policy_obj))
+            policy_k_gaps[policy_bucket].append(float(gap))
+            policy_k_objs[policy_bucket].append(float(policy_obj))
+
+    def _q(values: list[float], q: float) -> float:
+        arr = np.asarray([v for v in values if np.isfinite(v)], dtype=np.float64)
+        return float(np.quantile(arr, q)) if arr.size else float("nan")
+
+    gap_arr = np.asarray([v for v in gaps if np.isfinite(v)], dtype=np.float64)
+    vehicle_arr = np.asarray([v for v in vehicle_gaps if np.isfinite(v)], dtype=np.float64)
+    top10 = np.sort(gap_arr)[-10:] if gap_arr.size else np.asarray([], dtype=np.float64)
+    out = {
+        "eval_gap_mean": float(np.mean(gap_arr)) if gap_arr.size else float("nan"),
+        "eval_gap_median": _q(gaps, 0.50),
+        "eval_gap_p75": _q(gaps, 0.75),
+        "eval_gap_p90": _q(gaps, 0.90),
+        "eval_gap_p95": _q(gaps, 0.95),
+        "eval_gap_p99": _q(gaps, 0.99),
+        "eval_gap_gt50_count": int(np.sum(gap_arr > 50.0)) if gap_arr.size else 0,
+        "eval_gap_gt100_count": int(np.sum(gap_arr > 100.0)) if gap_arr.size else 0,
+        "eval_top10_hard_gap_mean": float(np.mean(top10)) if top10.size else float("nan"),
+        "eval_vehicle_gap_mean": float(np.mean(vehicle_arr)) if vehicle_arr.size else float("nan"),
+        "eval_vehicle_gap_median": _q(vehicle_gaps, 0.50),
+        "eval_vehicle_gap_p90": _q(vehicle_gaps, 0.90),
+        "eval_vehicle_gap_p95": _q(vehicle_gaps, 0.95),
+        "eval_vehicle_gap_gt0_count": int(np.sum(vehicle_arr > 0.0)) if vehicle_arr.size else 0,
+    }
+    for k in range(1, 5):
+        expert_gap_arr = np.asarray([v for v in expert_k_gaps[k] if np.isfinite(v)], dtype=np.float64)
+        expert_obj_arr = np.asarray([v for v in expert_k_objs[k] if np.isfinite(v)], dtype=np.float64)
+        policy_gap_arr = np.asarray([v for v in policy_k_gaps[k] if np.isfinite(v)], dtype=np.float64)
+        policy_obj_arr = np.asarray([v for v in policy_k_objs[k] if np.isfinite(v)], dtype=np.float64)
+        out[f"eval_gap_expertK{k}_mean"] = float(np.mean(expert_gap_arr)) if expert_gap_arr.size else float("nan")
+        out[f"eval_obj_expertK{k}_mean"] = float(np.mean(expert_obj_arr)) if expert_obj_arr.size else float("nan")
+        out[f"eval_gap_expertK{k}_count"] = int(expert_gap_arr.size)
+        out[f"eval_gap_policyK{k}_mean"] = float(np.mean(policy_gap_arr)) if policy_gap_arr.size else float("nan")
+        out[f"eval_obj_policyK{k}_mean"] = float(np.mean(policy_obj_arr)) if policy_obj_arr.size else float("nan")
+        out[f"eval_gap_policyK{k}_count"] = int(policy_gap_arr.size)
+    return out
+
+
+class HapsPrioritySampler:
+    def __init__(
+        self,
+        base_pool: Any,
+        references: dict[str, dict[str, float]],
+        *,
+        batch_size: int,
+        seed: int,
+        cfg: dict[str, Any],
+    ) -> None:
+        offline_cfg = cfg.get("offline", {}) or {}
+        self.instances = list(getattr(base_pool, "instances"))
+        self.references = references
+        self.instance_to_idx = {
+            str(getattr(instance, "instance_id")): idx
+            for idx, instance in enumerate(self.instances)
+            if getattr(instance, "instance_id", None) is not None
+        }
+        self.rng = np.random.default_rng(seed)
+        self.batch_size = max(1, int(batch_size))
+        self.mix_rho = float(offline_cfg.get("priority_mix_rho", 0.50))
+        self.alpha = float(offline_cfg.get("priority_alpha", 0.70))
+        self.priority_min = float(offline_cfg.get("priority_min", 0.05))
+        self.beta = float(offline_cfg.get("priority_update_beta", 0.20))
+        self.gap_scale = max(float(offline_cfg.get("gap_scale", 0.20)), 1e-8)
+        self.vehicle_gap_scale = max(float(offline_cfg.get("vehicle_gap_scale", 1.0)), 1e-8)
+        self.obj_weight = float(offline_cfg.get("priority_obj_weight", 0.75))
+        self.vehicle_weight = float(offline_cfg.get("priority_vehicle_weight", 0.25))
+        self.stale_window = max(float(offline_cfg.get("stale_window", 100)), 1e-8)
+        self.stale_bonus_weight = float(offline_cfg.get("stale_bonus_weight", 0.05))
+        init_priority = float(offline_cfg.get("priority_init", 1.0))
+        n = len(self.instances)
+        self.priority = np.full(n, init_priority, dtype=np.float64)
+        self.gap_ema = np.full(n, init_priority, dtype=np.float64)
+        self.vehicle_gap_ema = np.zeros(n, dtype=np.float64)
+        self.last_update_epoch = np.zeros(n, dtype=np.int64)
+        self.num_updates = np.zeros(n, dtype=np.int64)
+        self.current_epoch = 0
+        self.sample_count = 0
+        self.region_pool_status = f"haps_priority_fixed_dataset:{getattr(base_pool, 'dataset_path', '')}"
+        self._buffer: deque[int] = deque()
+        self._last_sample_indices: np.ndarray = np.asarray([], dtype=np.int64)
+        self._last_sample_stats: dict[str, Any] = {}
+
+    def begin_epoch(self, epoch: int) -> None:
+        self.current_epoch = int(epoch)
+        self._buffer.clear()
+
+    def _sample_priority(self) -> np.ndarray:
+        stale = np.clip((float(self.current_epoch) - self.last_update_epoch.astype(np.float64)) / self.stale_window, 0.0, 1.0)
+        return self.priority + self.stale_bonus_weight * stale
+
+    def _refill(self) -> None:
+        n = len(self.instances)
+        if n <= 0:
+            raise RuntimeError("HAPS priority sampler has no instances")
+        batch_size = min(self.batch_size, n)
+        rho = float(np.clip(self.mix_rho, 0.0, 1.0))
+        uniform_count = int(batch_size * (1.0 - rho))
+        priority_count = batch_size - uniform_count
+        all_indices = np.arange(n, dtype=np.int64)
+        uniform = (
+            self.rng.choice(all_indices, size=min(uniform_count, n), replace=False)
+            if uniform_count > 0
+            else np.asarray([], dtype=np.int64)
+        )
+        available = np.setdiff1d(all_indices, uniform, assume_unique=False)
+        priority_count = min(priority_count, available.size)
+        if priority_count > 0:
+            sample_priority = self._sample_priority()[available]
+            weights = np.power(np.maximum(sample_priority, 0.0), max(self.alpha, 0.0))
+            if not np.isfinite(weights).all() or float(weights.sum()) <= 0.0:
+                probs = None
+            else:
+                probs = weights / float(weights.sum())
+            weighted = self.rng.choice(available, size=priority_count, replace=False, p=probs)
+        else:
+            weighted = np.asarray([], dtype=np.int64)
+        selected = np.concatenate([uniform, weighted]).astype(np.int64)
+        self.rng.shuffle(selected)
+        stale_bonus = self._sample_priority() - self.priority
+        self._last_sample_indices = selected
+        self._last_sample_stats = {
+            "sampled_priority_mean": float(np.mean(self.priority[selected])) if selected.size else 0.0,
+            "priority_uniform_fraction": float(uniform.size / max(selected.size, 1)),
+            "priority_weighted_fraction": float(weighted.size / max(selected.size, 1)),
+            "unique_instance_ratio": float(np.unique(selected).size / max(selected.size, 1)),
+            "stale_bonus_mean": float(np.mean(stale_bonus[selected])) if selected.size else 0.0,
+        }
+        self._buffer = deque(int(i) for i in selected)
+
+    def sample(self):
+        if not self._buffer:
+            self._refill()
+        idx = int(self._buffer.popleft())
+        self.sample_count += 1
+        return self.instances[idx]
+
+    def update_from_rollout(self, batch, *, epoch: int) -> dict[str, Any]:
+        if batch is None:
+            return self.stats()
+        num_envs = int(batch.actions.size(1))
+        n_traj = int(batch.actions.size(2))
+        objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
+        vehicle = _final_vehicle_array(batch.final_infos, num_envs, n_traj)
+        instance_ids = list(getattr(batch, "instance_ids", []) or [])
+        gap_scores: list[float] = []
+        vehicle_scores: list[float] = []
+        raw_gaps: list[float] = []
+        raw_vehicle_gaps: list[float] = []
+        for env_idx in range(num_envs):
+            instance_id = str(instance_ids[env_idx]) if env_idx < len(instance_ids) else ""
+            idx = self.instance_to_idx.get(instance_id)
+            ref = self.references.get(instance_id)
+            if idx is None or ref is None:
+                continue
+            obj_row = objective[env_idx]
+            success_row = success[env_idx]
+            valid_obj = success_row & np.isfinite(obj_row)
+            if not np.any(valid_obj):
+                continue
+            policy_obj = float(np.mean(obj_row[valid_obj]))
+            expert_obj = float(ref.get("objective_distance_km", float("nan")))
+            if not np.isfinite(expert_obj) or expert_obj <= 0.0:
+                continue
+            gap = max((policy_obj - expert_obj) / (expert_obj + 1e-8), 0.0)
+            obj_score = float(np.clip(gap / self.gap_scale, 0.0, 1.0))
+            vehicle_row = vehicle[env_idx]
+            valid_vehicle = valid_obj & np.isfinite(vehicle_row)
+            if np.any(valid_vehicle) and np.isfinite(ref.get("vehicle_count", float("nan"))):
+                policy_vehicle = float(np.mean(vehicle_row[valid_vehicle]))
+                vehicle_gap = max(policy_vehicle - float(ref["vehicle_count"]), 0.0)
+            else:
+                vehicle_gap = 0.0
+            vehicle_score = float(np.clip(vehicle_gap / self.vehicle_gap_scale, 0.0, 1.0))
+            hard_score = self.obj_weight * obj_score + self.vehicle_weight * vehicle_score
+            self.priority[idx] = max((1.0 - self.beta) * self.priority[idx] + self.beta * hard_score, self.priority_min)
+            self.gap_ema[idx] = (1.0 - self.beta) * self.gap_ema[idx] + self.beta * gap
+            self.vehicle_gap_ema[idx] = (1.0 - self.beta) * self.vehicle_gap_ema[idx] + self.beta * vehicle_gap
+            self.last_update_epoch[idx] = int(epoch)
+            self.num_updates[idx] += 1
+            gap_scores.append(obj_score)
+            vehicle_scores.append(vehicle_score)
+            raw_gaps.append(gap)
+            raw_vehicle_gaps.append(vehicle_gap)
+        stats = self.stats()
+        stats.update(
+            {
+                "gap_score_mean": float(np.mean(gap_scores)) if gap_scores else 0.0,
+                "gap_score_std": float(np.std(gap_scores)) if gap_scores else 0.0,
+                "vehicle_score_mean": float(np.mean(vehicle_scores)) if vehicle_scores else 0.0,
+                "vehicle_score_std": float(np.std(vehicle_scores)) if vehicle_scores else 0.0,
+                "sampled_gap_mean": float(np.mean(raw_gaps)) if raw_gaps else 0.0,
+                "sampled_vehicle_gap_mean": float(np.mean(raw_vehicle_gaps)) if raw_vehicle_gaps else 0.0,
+            }
+        )
+        return stats
+
+    def stats(self) -> dict[str, Any]:
+        base = {
+            "priority_mean": float(np.mean(self.priority)) if self.priority.size else 0.0,
+            "priority_std": float(np.std(self.priority)) if self.priority.size else 0.0,
+            "priority_min": float(np.min(self.priority)) if self.priority.size else 0.0,
+            "priority_max": float(np.max(self.priority)) if self.priority.size else 0.0,
+            "num_priority_updates_mean": float(np.mean(self.num_updates)) if self.num_updates.size else 0.0,
+            "gap_score_mean": 0.0,
+            "gap_score_std": 0.0,
+            "vehicle_score_mean": 0.0,
+            "vehicle_score_std": 0.0,
+            "sampled_gap_mean": 0.0,
+            "sampled_vehicle_gap_mean": 0.0,
+        }
+        base.update(self._last_sample_stats)
+        for key in (
+            "sampled_priority_mean",
+            "priority_uniform_fraction",
+            "priority_weighted_fraction",
+            "unique_instance_ratio",
+            "stale_bonus_mean",
+        ):
+            base.setdefault(key, 0.0)
+        return base
+
+
+def _resolve_path(path: str | Path | None) -> Path | None:
+    if path is None or str(path) == "":
+        return None
+    out = Path(path)
+    return out if out.is_absolute() else REPO_ROOT / out
+
+
+def _load_agent_checkpoint(
+    agent: Agent,
+    path: str | Path | None,
+    device: str | torch.device,
+    *,
+    strict: bool = True,
+) -> dict[str, Any]:
+    ckpt_path = _resolve_path(path)
+    if ckpt_path is None:
+        return {}
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    if isinstance(checkpoint, dict):
+        state_dict = (
+            checkpoint.get("model_state_dict")
+            or checkpoint.get("agent_state_dict")
+            or checkpoint.get("state_dict")
+            or checkpoint
+        )
+    else:
+        state_dict = checkpoint
+        checkpoint = {}
+    result = agent.load_state_dict(state_dict, strict=strict)
+    return {
+        "checkpoint_path": str(ckpt_path),
+        "epoch": checkpoint.get("epoch") if isinstance(checkpoint, dict) else None,
+        "seed": checkpoint.get("seed") if isinstance(checkpoint, dict) else None,
+        "missing_keys": list(getattr(result, "missing_keys", [])),
+        "unexpected_keys": list(getattr(result, "unexpected_keys", [])),
+    }
+
+
+def _eval_instance_batches(
+    eval_path: Path,
+    num_customers: int,
+    num_charging_stations: int,
+    batch_size: int,
+    limit: int | None = None,
+    num_batches_limit: int | None = None,
+):
+    max_count = None if limit is None else int(limit)
+    if num_batches_limit is not None:
+        by_batches = max(1, int(batch_size)) * int(num_batches_limit)
+        max_count = by_batches if max_count is None else min(max_count, by_batches)
+    batch = []
+    seen = 0
+    for instance in iter_instances(
+        eval_path,
+        num_customers=num_customers,
+        num_charging_stations=num_charging_stations,
+    ):
+        if max_count is not None and seen >= max_count:
+            break
+        batch.append(instance)
+        seen += 1
+        if len(batch) >= max(1, int(batch_size)):
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _empty_eval_row(
+    *,
+    n_traj: int,
+    batch_size: int,
+    num_batches: int,
+    decode_mode: str,
+    eval_info_level: str,
+    eval_save_routes: bool,
+    status: str,
+) -> dict[str, Any]:
+    return {
+        "eval_num_instances": 0,
+        "eval_n_traj": n_traj,
+        "eval_batch_size": batch_size,
+        "eval_num_batches": num_batches,
+        "eval_decode_mode": decode_mode,
+        "eval_info_level": eval_info_level,
+        "eval_save_routes": eval_save_routes,
+        "eval_feasible_rate": np.nan,
+        "eval_traj_feasible_rate": np.nan,
+        "eval_avg_feasible_traj_count": np.nan,
+        "eval_avg_objective_distance_km": np.nan,
+        "eval_avg_min_objective_distance_km": np.nan,
+        "eval_avg_median_objective_distance_km": np.nan,
+        "eval_avg_vehicle_count": np.nan,
+        "eval_avg_min_vehicle_count": np.nan,
+        "eval_avg_median_vehicle_count": np.nan,
+        "eval_avg_runtime_s": np.nan,
+        "eval_status": status,
+        "eval_gap_mean": np.nan,
+        "eval_gap_median": np.nan,
+        "eval_gap_p75": np.nan,
+        "eval_gap_p90": np.nan,
+        "eval_gap_p95": np.nan,
+        "eval_gap_p99": np.nan,
+        "eval_gap_gt50_count": 0,
+        "eval_gap_gt100_count": 0,
+        "eval_top10_hard_gap_mean": np.nan,
+        "eval_vehicle_gap_mean": np.nan,
+        "eval_vehicle_gap_median": np.nan,
+        "eval_vehicle_gap_p90": np.nan,
+        "eval_vehicle_gap_p95": np.nan,
+        "eval_vehicle_gap_gt0_count": 0,
+        **{
+            key: value
+            for k in range(1, 5)
+            for key, value in {
+                f"eval_gap_expertK{k}_mean": np.nan,
+                f"eval_obj_expertK{k}_mean": np.nan,
+                f"eval_gap_expertK{k}_count": 0,
+                f"eval_gap_policyK{k}_mean": np.nan,
+                f"eval_obj_policyK{k}_mean": np.nan,
+                f"eval_gap_policyK{k}_count": 0,
+            }.items()
+        },
+    }
+
+
+def _select_min_median_trajectory_stats(info: dict[str, Any]) -> dict[str, Any]:
+    objective = np.asarray(info.get("objective_distance_km", []), dtype=np.float64).reshape(-1)
+    success = np.asarray(info.get("success", []), dtype=bool).reshape(-1)
+    vehicle = np.asarray(info.get("vehicle_count", []), dtype=np.float64).reshape(-1)
+    served = np.asarray(info.get("served_customers", []), dtype=np.float64).reshape(-1)
+
+    finite_obj = np.isfinite(objective)
+    success_mask = np.zeros(objective.shape, dtype=bool)
+    success_mask[: min(success.size, objective.size)] = success[: min(success.size, objective.size)]
+    candidate_mask = success_mask & finite_obj
+    feasible = bool(np.any(candidate_mask))
+    if not feasible:
+        if served.size:
+            served_pad = np.full(objective.shape, np.nan, dtype=np.float64)
+            served_pad[: min(served.size, objective.size)] = served[: min(served.size, objective.size)]
+            finite_served = np.isfinite(served_pad)
+            if np.any(finite_served & finite_obj):
+                max_served = float(np.nanmax(served_pad[finite_served & finite_obj]))
+                candidate_mask = finite_obj & (served_pad == max_served)
+        if not np.any(candidate_mask):
+            candidate_mask = finite_obj
+
+    candidate_idx = np.where(candidate_mask)[0]
+    if candidate_idx.size == 0:
+        return {
+            "feasible": False,
+            "traj_feasible_rate": float(np.mean(success)) if success.size else np.nan,
+            "feasible_traj_count": 0.0,
+            "objective_distance_km": np.nan,
+            "min_objective_distance_km": np.nan,
+            "median_objective_distance_km": np.nan,
+            "vehicle_count": np.nan,
+            "min_vehicle_count": np.nan,
+            "median_vehicle_count": np.nan,
+        }
+
+    candidate_obj = objective[candidate_idx]
+    order = np.argsort(candidate_obj)
+    min_idx = int(candidate_idx[order[0]])
+    median_idx = int(candidate_idx[order[len(order) // 2]])
+    median_obj = float(np.median(candidate_obj))
+
+    def _vehicle_at(idx: int) -> float:
+        if 0 <= idx < vehicle.size and np.isfinite(vehicle[idx]):
+            return float(vehicle[idx])
+        return np.nan
+
+    return {
+        "feasible": feasible,
+        "traj_feasible_rate": float(np.mean(success)) if success.size else np.nan,
+        "feasible_traj_count": float(np.sum(success)) if success.size else np.nan,
+        "objective_distance_km": float(objective[min_idx]),
+        "min_objective_distance_km": float(objective[min_idx]),
+        "median_objective_distance_km": median_obj,
+        "vehicle_count": _vehicle_at(min_idx),
+        "min_vehicle_count": _vehicle_at(min_idx),
+        "median_vehicle_count": _vehicle_at(median_idx),
+    }
+
+
+def _rollout_eval_batch_min_median(
+    agent: Agent,
+    envs,
+    decode_mode: str,
+    max_steps: int,
+    device: str | torch.device,
+    seed: int | None = None,
+) -> list[dict[str, Any]]:
+    if not envs:
+        return []
+    observations, infos = reset_envs(envs, seed=seed)
+    n_traj = int(envs[0].unwrapped.n_traj)
+    done = np.zeros((len(envs), n_traj), dtype=bool)
+    start = time.perf_counter()
+    for _ in range(int(max_steps)):
+        obs_batch = stack_observations(observations)
+        with torch.no_grad():
+            actions, _, _, _, _ = sample_actions(agent, obs_batch, decode_mode=decode_mode, device=device)
+        action_np = actions.detach().cpu().numpy().astype(np.int64)
+        observations, _, step_done, infos = step_envs(envs, action_np)
+        done = done | step_done
+        if done.all():
+            break
+    elapsed = time.perf_counter() - start
+    per_instance_runtime = float(elapsed) / max(len(envs), 1)
+    rows = []
+    for info in infos:
+        row = _select_min_median_trajectory_stats(info)
+        row["runtime_s"] = per_instance_runtime
+        row["batch_runtime_s"] = float(elapsed)
+        rows.append(row)
+    return rows
+
+
+def evaluate_fixed_dataset(agent: Agent, cfg: dict[str, Any], seed: int, epoch: int, device: str | torch.device) -> dict[str, Any]:
+    eval_cfg = cfg.get("evaluation", {}) or {}
+    data_cfg = cfg.get("data", {}) or {}
+    num_customers = int(data_cfg.get("num_customers", 15))
+    num_cs = int(data_cfg.get("num_charging_stations", 3))
+    eval_path = _resolve_path(eval_cfg.get("eval_path"))
+    n_traj = int(eval_cfg.get("eval_n_traj", 8))
+    decode_mode = str(eval_cfg.get("eval_decode_mode", "sample"))
+    max_steps = int(eval_cfg.get("eval_max_steps", 128))
+    limit = eval_cfg.get("eval_limit", None)
+    batch_size = max(1, int(eval_cfg.get("eval_batch_size", 1)))
+    num_batches_limit = eval_cfg.get("eval_num_batches", None)
+    eval_save_routes = bool(eval_cfg.get("eval_save_routes", False))
+    eval_info_level = str(eval_cfg.get("eval_info_level", "light"))
+    reference_path = (
+        eval_cfg.get("gurobi_summary_path")
+        or eval_cfg.get("eval_gurobi_summary")
+        or eval_cfg.get("reference_summary_path")
+        or eval_cfg.get("expert_solution_path")
+    )
+    reference_metrics = _load_reference_metrics(reference_path)
+    if eval_path is None or not eval_path.exists():
+        return _empty_eval_row(
+            n_traj=n_traj,
+            batch_size=batch_size,
+            num_batches=0,
+            decode_mode=decode_mode,
+            eval_info_level=eval_info_level,
+            eval_save_routes=eval_save_routes,
+            status=f"missing_eval_path:{eval_path}",
+        )
+
+    was_training = agent.training
+    agent.eval()
+    rows: list[dict[str, Any]] = []
+    num_batches = 0
+    seen_before_batch = 0
+    for instances in _eval_instance_batches(eval_path, num_customers, num_cs, batch_size, limit, num_batches_limit):
+        eval_env_cfg = dict(cfg.get("env", {}) or {})
+        if bool(eval_env_cfg.get("use_fast_env", True)):
+            eval_env_cfg["info_level"] = "full" if eval_save_routes else eval_info_level
+        envs = [make_terran_env(instance=instance, n_traj=n_traj, **eval_env_cfg) for instance in instances]
+        batch_rows = _rollout_eval_batch_min_median(
+            agent,
+            envs,
+            decode_mode=decode_mode,
+            max_steps=max_steps,
+            device=device,
+            seed=seed + epoch * 1_000_000 + seen_before_batch,
+        )
+        for instance, row in zip(instances, batch_rows):
+            row["instance_id"] = instance.instance_id
+        rows.extend(batch_rows)
+        num_batches += 1
+        seen_before_batch += len(instances)
+
+    if was_training:
+        agent.train()
+    if not rows:
+        return _empty_eval_row(
+            n_traj=n_traj,
+            batch_size=batch_size,
+            num_batches=0,
+            decode_mode=decode_mode,
+            eval_info_level=eval_info_level,
+            eval_save_routes=eval_save_routes,
+            status=f"no_instances:{eval_path}",
+        )
+
+    feasible_rows = [row for row in rows if row["feasible"]]
+    out = {
+        "eval_num_instances": len(rows),
+        "eval_n_traj": n_traj,
+        "eval_batch_size": batch_size,
+        "eval_num_batches": num_batches,
+        "eval_decode_mode": decode_mode,
+        "eval_info_level": eval_info_level,
+        "eval_save_routes": eval_save_routes,
+        "eval_feasible_rate": float(np.mean([row["feasible"] for row in rows])),
+        "eval_traj_feasible_rate": float(np.nanmean([row["traj_feasible_rate"] for row in rows])),
+        "eval_avg_feasible_traj_count": float(np.nanmean([row["feasible_traj_count"] for row in rows])),
+        "eval_avg_objective_distance_km": float(np.nanmean([row["objective_distance_km"] for row in feasible_rows])) if feasible_rows else np.nan,
+        "eval_avg_min_objective_distance_km": float(np.nanmean([row["min_objective_distance_km"] for row in feasible_rows])) if feasible_rows else np.nan,
+        "eval_avg_median_objective_distance_km": float(np.nanmean([row["median_objective_distance_km"] for row in feasible_rows])) if feasible_rows else np.nan,
+        "eval_avg_vehicle_count": float(np.nanmean([row["vehicle_count"] for row in feasible_rows])) if feasible_rows else np.nan,
+        "eval_avg_min_vehicle_count": float(np.nanmean([row["min_vehicle_count"] for row in feasible_rows])) if feasible_rows else np.nan,
+        "eval_avg_median_vehicle_count": float(np.nanmean([row["median_vehicle_count"] for row in feasible_rows])) if feasible_rows else np.nan,
+        "eval_avg_runtime_s": float(np.nanmean([row["runtime_s"] for row in rows])),
+        "eval_status": "ok",
+    }
+    if reference_metrics:
+        out.update(_tail_gap_stats(rows, reference_metrics))
+    return out
+
+
+def _policy_mean_successful_objective(batch) -> float | None:
+    num_envs = int(batch.actions.size(1))
+    n_traj = int(batch.actions.size(2))
+    objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
+    successful = objective[success & np.isfinite(objective)]
+    if successful.size == 0:
+        return None
+    return float(np.mean(successful))
 
 
 def _update_policy_best_objectives(
@@ -858,6 +1476,8 @@ def _dapg_demo_gate_from_rollout(
         return 1.0, {
             "dapg_demo_gate_mean": 1.0,
             "dapg_demo_gate_std": 0.0,
+            "dapg_demo_active_ratio": 1.0,
+            "expert_better_ratio": 1.0,
             "dapg_memory_better_rate": 0.0,
             "dapg_memory_gap_mean": 0.0,
         }
@@ -867,6 +1487,7 @@ def _dapg_demo_gate_from_rollout(
     objective, success, _ = _final_info_arrays(batch.final_infos, num_envs, n_traj)
     eta = max(float(offline_cfg.get("dapg_demo_gate_eta", 0.05)), 1e-8)
     margin = max(float(offline_cfg.get("dapg_demo_gate_margin", 0.0)), 0.0)
+    policy_base = str(offline_cfg.get("dapg_demo_gate_policy_base", "best_successful")).lower()
     use_memory = bool(offline_cfg.get("use_dapg_memory_gate", True))
     gates: list[float] = []
     memory_better = 0
@@ -876,10 +1497,14 @@ def _dapg_demo_gate_from_rollout(
         ref_obj = expert_buffer.reference_objective(instance_id)
         if ref_obj is None or not np.isfinite(ref_obj) or ref_obj <= 0.0:
             continue
-        best_known = np.inf
         current_success = objective[env_idx][success[env_idx] & np.isfinite(objective[env_idx])]
         if current_success.size > 0:
-            best_known = min(best_known, float(np.min(current_success)))
+            if policy_base in {"mean_successful", "mean", "avg_successful", "average_successful"}:
+                best_known = float(np.mean(current_success))
+            else:
+                best_known = float(np.min(current_success))
+        else:
+            best_known = np.inf
         if use_memory and policy_best_objectives is not None and instance_id is not None:
             memory_obj = policy_best_objectives.get(instance_id)
             if memory_obj is not None and np.isfinite(memory_obj) and memory_obj > 0.0:
@@ -899,13 +1524,18 @@ def _dapg_demo_gate_from_rollout(
         return 1.0, {
             "dapg_demo_gate_mean": 1.0,
             "dapg_demo_gate_std": 0.0,
+            "dapg_demo_active_ratio": 1.0,
+            "expert_better_ratio": 1.0,
             "dapg_memory_better_rate": 0.0,
             "dapg_memory_gap_mean": 0.0,
         }
     gate_arr = np.asarray(gates, dtype=np.float64)
+    active_ratio = float(np.mean(gate_arr > 1e-8))
     return float(gate_arr.mean()), {
         "dapg_demo_gate_mean": float(gate_arr.mean()),
         "dapg_demo_gate_std": float(gate_arr.std()),
+        "dapg_demo_active_ratio": active_ratio,
+        "expert_better_ratio": active_ratio,
         "dapg_memory_better_rate": float(memory_better / max(len(gates), 1)),
         "dapg_memory_gap_mean": float(np.mean(memory_gaps)) if memory_gaps else 0.0,
     }
@@ -930,12 +1560,218 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask).sum() / denom
 
 
+def _evaluate_policy_loss_with_stats(
+    agent,
+    batch,
+    returns,
+    advantages,
+    cfg,
+    env_indices: Sequence[int] | np.ndarray | None = None,
+    step_start: int = 0,
+    step_end: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+    train_cfg = cfg["training"]
+    clip_coef = float(train_cfg.get("clip_coef", 0.2))
+    vf_coef = float(train_cfg.get("vf_coef", 0.5))
+    ent_coef = float(train_cfg.get("ent_coef", 0.01))
+    if env_indices is None:
+        env_indices = np.arange(batch.actions.size(1), dtype=np.int64)
+    else:
+        env_indices = np.asarray(env_indices, dtype=np.int64)
+
+    if step_end is None:
+        step_end = len(batch.observations)
+    step_start = max(0, int(step_start))
+    step_end = min(len(batch.observations), int(step_end))
+    if step_start >= step_end:
+        raise ValueError(f"empty PPO step range: [{step_start}, {step_end})")
+
+    cached_state = agent.backbone.encode(_slice_obs_by_env(batch.observations[0], env_indices))
+    policy_losses = []
+    value_losses = []
+    entropy_losses = []
+    approx_kls = []
+    clip_fracs = []
+    for step in range(step_start, step_end):
+        obs_mb = _slice_obs_by_env(batch.observations[step], env_indices)
+        actions = batch.actions[step, env_indices].long()
+        old_logprob = batch.old_logprobs[step, env_indices]
+        _, new_logprob, entropy, value, _ = agent.get_action_and_value_cached(
+            obs_mb,
+            action=actions,
+            state=cached_state,
+        )
+        value = value.squeeze(-1)
+        logratio = new_logprob - old_logprob
+        ratio = torch.exp(logratio)
+        adv = advantages[step, env_indices]
+        unclipped = ratio * adv
+        clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv
+        valid = batch.valid[step, env_indices]
+        policy_losses.append(-_masked_mean(torch.minimum(unclipped, clipped), valid))
+        value_losses.append(_masked_mean(F.mse_loss(value, returns[step, env_indices], reduction="none"), valid))
+        entropy_losses.append(_masked_mean(entropy, valid))
+        with torch.no_grad():
+            approx_kls.append(_masked_mean((ratio - 1.0) - logratio, valid))
+            clip_fracs.append(_masked_mean((torch.abs(ratio - 1.0) > clip_coef).float(), valid))
+    policy_loss = torch.stack(policy_losses).mean()
+    value_loss = torch.stack(value_losses).mean()
+    entropy_loss = torch.stack(entropy_losses).mean()
+    total = policy_loss + vf_coef * value_loss - ent_coef * entropy_loss
+    stats = {
+        "approx_kl": float(torch.stack(approx_kls).mean().detach().cpu().item()) if approx_kls else 0.0,
+        "clip_fraction": float(torch.stack(clip_fracs).mean().detach().cpu().item()) if clip_fracs else 0.0,
+    }
+    return total, policy_loss.detach(), value_loss.detach(), entropy_loss.detach(), stats
+
+
+def _evaluate_policy_loss_policy_only_with_stats(
+    agent,
+    batch,
+    advantages,
+    cfg,
+    env_indices: Sequence[int] | np.ndarray | None = None,
+    step_start: int = 0,
+    step_end: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+    train_cfg = cfg["training"]
+    clip_coef = float(train_cfg.get("clip_coef", 0.2))
+    ent_coef = float(train_cfg.get("ent_coef", 0.01))
+    if env_indices is None:
+        env_indices = np.arange(batch.actions.size(1), dtype=np.int64)
+    else:
+        env_indices = np.asarray(env_indices, dtype=np.int64)
+
+    if step_end is None:
+        step_end = len(batch.observations)
+    step_start = max(0, int(step_start))
+    step_end = min(len(batch.observations), int(step_end))
+    if step_start >= step_end:
+        raise ValueError(f"empty PPO step range: [{step_start}, {step_end})")
+
+    cached_state = agent.backbone.encode(_slice_obs_by_env(batch.observations[0], env_indices))
+    policy_losses = []
+    entropy_losses = []
+    approx_kls = []
+    clip_fracs = []
+    for step in range(step_start, step_end):
+        obs_mb = _slice_obs_by_env(batch.observations[step], env_indices)
+        actions = batch.actions[step, env_indices].long()
+        old_logprob = batch.old_logprobs[step, env_indices]
+        _, new_logprob, entropy, _value, _ = agent.get_action_and_value_cached(
+            obs_mb,
+            action=actions,
+            state=cached_state,
+        )
+        logratio = new_logprob - old_logprob
+        ratio = torch.exp(logratio)
+        adv = advantages[step, env_indices]
+        unclipped = ratio * adv
+        clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv
+        valid = batch.valid[step, env_indices]
+        policy_losses.append(-_masked_mean(torch.minimum(unclipped, clipped), valid))
+        entropy_losses.append(_masked_mean(entropy, valid))
+        with torch.no_grad():
+            approx_kls.append(_masked_mean((ratio - 1.0) - logratio, valid))
+            clip_fracs.append(_masked_mean((torch.abs(ratio - 1.0) > clip_coef).float(), valid))
+    policy_loss = torch.stack(policy_losses).mean()
+    value_loss = torch.zeros((), device=policy_loss.device, dtype=policy_loss.dtype)
+    entropy_loss = torch.stack(entropy_losses).mean()
+    total = policy_loss - ent_coef * entropy_loss
+    stats = {
+        "approx_kl": float(torch.stack(approx_kls).mean().detach().cpu().item()) if approx_kls else 0.0,
+        "clip_fraction": float(torch.stack(clip_fracs).mean().detach().cpu().item()) if clip_fracs else 0.0,
+    }
+    return total, policy_loss.detach(), value_loss.detach(), entropy_loss.detach(), stats
+
+
+def _compute_pomo_trajectory_advantages(
+    batch,
+    envs,
+    cfg: dict[str, Any],
+    device: str | torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    num_envs = int(batch.actions.size(1))
+    n_traj = int(batch.actions.size(2))
+    valid = batch.valid
+    reward_sum = (batch.rewards * valid.float()).sum(dim=0)
+    objective, success, _served = _final_info_arrays(batch.final_infos, num_envs, n_traj)
+
+    rewards_np = reward_sum.detach().cpu().numpy().astype(np.float64, copy=True)
+    used_objective = np.zeros((num_envs, n_traj), dtype=bool)
+    success_mask = np.zeros((num_envs, n_traj), dtype=bool)
+    for env_idx, env in enumerate(envs[:num_envs]):
+        scale = _reward_scale_from_env(env)
+        obj_row = objective[env_idx]
+        suc_row = success[env_idx]
+        finite_obj = np.isfinite(obj_row) & (obj_row > 0.0) & suc_row
+        if finite_obj.any():
+            rewards_np[env_idx, finite_obj] = -obj_row[finite_obj] / max(float(scale), 1e-9)
+            used_objective[env_idx, finite_obj] = True
+        success_mask[env_idx, : min(n_traj, suc_row.size)] = suc_row[:n_traj]
+
+    traj_valid_np = valid.detach().cpu().numpy().any(axis=0)
+    rewards_np = np.where(traj_valid_np & np.isfinite(rewards_np), rewards_np, 0.0)
+    raw_adv = np.zeros_like(rewards_np, dtype=np.float64)
+    baselines = np.zeros(num_envs, dtype=np.float64)
+    within_stds: list[float] = []
+    within_means: list[float] = []
+    valid_counts: list[int] = []
+    for env_idx in range(num_envs):
+        mask = traj_valid_np[env_idx] & np.isfinite(rewards_np[env_idx])
+        valid_counts.append(int(mask.sum()))
+        if not mask.any():
+            continue
+        values = rewards_np[env_idx, mask]
+        baseline = float(values.mean())
+        baselines[env_idx] = baseline
+        raw_adv[env_idx, mask] = values - baseline
+        within_stds.append(float(values.std()))
+        within_means.append(float(values.mean()))
+
+    raw_valid = raw_adv[traj_valid_np]
+    if raw_valid.size > 1:
+        raw_mean = float(raw_valid.mean())
+        raw_std = float(raw_valid.std())
+        norm_adv = (raw_adv - raw_mean) / max(raw_std, 1e-8)
+    else:
+        raw_mean = float(raw_valid.mean()) if raw_valid.size else 0.0
+        raw_std = 0.0
+        norm_adv = raw_adv
+    norm_adv = np.where(traj_valid_np, norm_adv, 0.0)
+    adv_tensor = torch.as_tensor(norm_adv, device=device, dtype=batch.rewards.dtype).unsqueeze(0).expand_as(batch.rewards)
+    adv_tensor = adv_tensor * valid.float()
+    returns = torch.zeros_like(batch.rewards)
+
+    norm_valid = norm_adv[traj_valid_np]
+    reward_valid = rewards_np[traj_valid_np]
+    info = {
+        "advantage_mode": "pomo_trajectory",
+        "pomo_reward_mean": float(reward_valid.mean()) if reward_valid.size else 0.0,
+        "pomo_reward_std": float(reward_valid.std()) if reward_valid.size else 0.0,
+        "pomo_baseline_mean": float(np.mean(baselines)) if baselines.size else 0.0,
+        "pomo_within_reward_std_mean": float(np.mean(within_stds)) if within_stds else 0.0,
+        "pomo_within_reward_std_p10": float(np.quantile(within_stds, 0.10)) if within_stds else 0.0,
+        "pomo_within_reward_std_p90": float(np.quantile(within_stds, 0.90)) if within_stds else 0.0,
+        "pomo_valid_traj_ratio": float(traj_valid_np.mean()) if traj_valid_np.size else 0.0,
+        "pomo_success_traj_ratio": float(success_mask[traj_valid_np].mean()) if traj_valid_np.any() else 0.0,
+        "pomo_objective_used_ratio": float(used_objective[traj_valid_np].mean()) if traj_valid_np.any() else 0.0,
+        "pomo_adv_raw_mean": raw_mean,
+        "pomo_adv_raw_std": raw_std,
+        "pomo_adv_norm_mean": float(norm_valid.mean()) if norm_valid.size else 0.0,
+        "pomo_adv_norm_std": float(norm_valid.std()) if norm_valid.size else 0.0,
+        "pomo_valid_traj_count_mean": float(np.mean(valid_counts)) if valid_counts else 0.0,
+    }
+    return returns, adv_tensor, info
+
+
 def _compute_gae_from_rewards(
     rewards: torch.Tensor,
     values: torch.Tensor,
     dones: torch.Tensor,
     gamma: float,
     gae_lambda: float,
+    route_boundaries: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     values = _to_scalar_values(values)
     advantages = torch.zeros_like(rewards)
@@ -945,9 +1781,13 @@ def _compute_gae_from_rewards(
             next_value = torch.zeros_like(values[step])
         else:
             next_value = values[step + 1]
-        next_nonterminal = (~dones[step]).float()
-        delta = rewards[step] + float(gamma) * next_value * next_nonterminal - values[step]
-        last_gae = delta + float(gamma) * float(gae_lambda) * next_nonterminal * last_gae
+        bootstrap_nonterminal = (~dones[step]).float()
+        if route_boundaries is None:
+            gae_nonterminal = bootstrap_nonterminal
+        else:
+            gae_nonterminal = (~(dones[step] | route_boundaries[step])).float()
+        delta = rewards[step] + float(gamma) * next_value * bootstrap_nonterminal - values[step]
+        last_gae = delta + float(gamma) * float(gae_lambda) * gae_nonterminal * last_gae
         advantages[step] = last_gae
     returns = advantages + values
     return returns, advantages
@@ -963,8 +1803,21 @@ def _compute_discounted_returns(rewards: torch.Tensor, dones: torch.Tensor, gamm
     return returns
 
 
-def _compute_gae_returns(batch, gamma: float, gae_lambda: float) -> tuple[torch.Tensor, torch.Tensor]:
-    return _compute_gae_from_rewards(batch.rewards, _value_head(batch.values, 0), batch.dones, gamma, gae_lambda)
+def _compute_gae_returns(
+    batch,
+    gamma: float,
+    gae_lambda: float,
+    route_segmented: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    route_boundaries = getattr(batch, "route_boundaries", None) if route_segmented else None
+    return _compute_gae_from_rewards(
+        batch.rewards,
+        _value_head(batch.values, 0),
+        batch.dones,
+        gamma,
+        gae_lambda,
+        route_boundaries=route_boundaries,
+    )
 
 
 def _normalize_valid(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -1065,6 +1918,7 @@ def _compute_decomposed_returns_advantages(
     gae_lambda: float,
     use_gae: bool,
     cfg: dict[str, Any],
+    route_segmented: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, dict[str, float]]:
     decomposition_error_info = _attach_decomposed_rewards(batch)
     rewards = _decompose_distance_rewards(batch)
@@ -1075,9 +1929,17 @@ def _compute_decomposed_returns_advantages(
     }
     returns: dict[str, torch.Tensor] = {}
     advantages: dict[str, torch.Tensor] = {}
+    route_boundaries = getattr(batch, "route_boundaries", None) if route_segmented else None
     for name in ("total", "boundary", "internal"):
         if use_gae:
-            ret, adv = _compute_gae_from_rewards(rewards[name], values[name], batch.dones, gamma, gae_lambda)
+            ret, adv = _compute_gae_from_rewards(
+                rewards[name],
+                values[name],
+                batch.dones,
+                gamma,
+                gae_lambda,
+                route_boundaries=route_boundaries,
+            )
         else:
             ret = _compute_discounted_returns(rewards[name], batch.dones, gamma)
             adv = ret - values[name]
@@ -2279,6 +3141,7 @@ def _load_expert_buffer(cfg: dict[str, Any], seed: int, debug_enabled: bool, deb
         cfg,
         max_records=offline_cfg.get("max_replay_records"),
         strict=bool(offline_cfg.get("strict_replay", True)),
+        seed=seed + int(offline_cfg.get("replay_seed_offset", 17_000)),
     )
     _debug_log(
         debug_enabled,
@@ -2286,9 +3149,19 @@ def _load_expert_buffer(cfg: dict[str, Any], seed: int, debug_enabled: bool, deb
         "[OfflineArchive] "
         f"method={method} records={stats['records_seen']} trajectories={stats['trajectories']} "
         f"invalid={stats['invalid_records']} steps={stats['steps']} "
-        f"avg_steps={stats['avg_steps_per_route']:.3f} solution_path={solution_path}",
+        f"avg_steps={stats['avg_steps_per_route']:.3f} "
+        f"success_rate={stats.get('expert_replay_success_rate', 0.0):.6f} "
+        f"valid_ratio={stats.get('expert_action_valid_ratio', 0.0):.6f} "
+        f"obj_error_max={stats.get('expert_env_replay_obj_error_max', float('nan')):.6g} "
+        f"route_count_mean={stats.get('expert_route_count_mean', 0.0):.3f} "
+        f"solution_path={solution_path}",
     )
-    return ExpertReplayBuffer(trajectories, seed=seed + int(offline_cfg.get("replay_seed_offset", 17_000)))
+    buffer = ExpertReplayBuffer(
+        trajectories,
+        seed=seed + int(offline_cfg.get("replay_seed_offset", 17_000)),
+        replay_stats=stats,
+    )
+    return buffer
 
 
 def _run_bc_updates(
@@ -2304,15 +3177,15 @@ def _run_bc_updates(
     scaler=None,
     amp_enabled: bool = False,
 ) -> dict[str, Any]:
+    del epoch
     offline_cfg = cfg.get("offline", {}) or {}
     batch_size = int(offline_cfg.get("bc_batch_size", 256))
     max_grad_norm = float(cfg.get("training", {}).get("max_grad_norm", 1.0))
-    losses = []
-    accs = []
-    entropies = []
+    losses: list[float] = []
+    accs: list[float] = []
+    action_accs: list[float] = []
+    entropies: list[float] = []
     steps = 0
-    if coef <= 0.0 or updates <= 0:
-        return {"bc_loss": 0.0, "bc_accuracy": 0.0, "bc_entropy": 0.0, "bc_steps": 0, "bc_coef": coef, "offline_updates": 0}
     agent.train()
     for _ in range(int(updates)):
         optimizer.zero_grad(set_to_none=True)
@@ -2322,11 +3195,13 @@ def _run_bc_updates(
         _optimizer_step(optimizer, agent, max_grad_norm, scaler, amp_enabled)
         losses.append(float(info["bc_loss"]))
         accs.append(float(info["bc_accuracy"]))
+        action_accs.append(float(info.get("bc_action_accuracy", info["bc_accuracy"])))
         entropies.append(float(info["bc_entropy"]))
         steps += int(info["bc_steps"])
     return {
         "bc_loss": float(np.mean(losses)) if losses else 0.0,
         "bc_accuracy": float(np.mean(accs)) if accs else 0.0,
+        "bc_action_accuracy": float(np.mean(action_accs)) if action_accs else 0.0,
         "bc_entropy": float(np.mean(entropies)) if entropies else 0.0,
         "bc_steps": int(steps),
         "bc_coef": float(coef),
@@ -2334,51 +3209,8 @@ def _run_bc_updates(
     }
 
 
-def _run_route_bc_updates(
-    agent: Agent,
-    optimizer: torch.optim.Optimizer,
-    expert_buffer: ExpertReplayBuffer,
-    cfg: dict[str, Any],
-    device: str | torch.device,
-    epoch: int,
-    *,
-    coef: float,
-    updates: int,
-    scaler=None,
-    amp_enabled: bool = False,
-) -> dict[str, Any]:
-    offline_cfg = cfg.get("offline", {}) or {}
-    batch_size = int(offline_cfg.get("route_batch_size", offline_cfg.get("bc_batch_size", 256)))
-    max_grad_norm = float(cfg.get("training", {}).get("max_grad_norm", 1.0))
-    losses = []
-    entropies = []
-    route_counts = []
-    route_lens = []
-    steps = 0
-    if coef <= 0.0 or updates <= 0:
-        return {"route_bc_loss": 0.0, "route_bc_entropy": 0.0, "route_bc_count": 0, "route_bc_step_count": 0, "route_bc_avg_route_len": 0.0, "route_bc_coef": coef, "offline_updates": 0}
-    agent.train()
-    for _ in range(int(updates)):
-        optimizer.zero_grad(set_to_none=True)
-        with _autocast_context(device, amp_enabled):
-            loss, info = compute_route_supervised_loss(agent, expert_buffer, batch_size=batch_size, device=device)
-        _backward(float(coef) * loss, scaler, amp_enabled)
-        _optimizer_step(optimizer, agent, max_grad_norm, scaler, amp_enabled)
-        losses.append(float(info["sl_route_loss"]))
-        entropies.append(float(info["sl_route_entropy"]))
-        route_counts.append(float(info["sl_route_count"]))
-        route_lens.append(float(info["sl_avg_route_len"]))
-        steps += int(info["sl_step_count"])
-    return {
-        "route_bc_loss": float(np.mean(losses)) if losses else 0.0,
-        "route_bc_entropy": float(np.mean(entropies)) if entropies else 0.0,
-        "route_bc_count": int(np.sum(route_counts)) if route_counts else 0,
-        "route_bc_step_count": int(steps),
-        "route_bc_avg_route_len": float(np.mean(route_lens)) if route_lens else 0.0,
-        "route_bc_coef": float(coef),
-        "offline_updates": int(updates),
-    }
-
+def _run_route_bc_updates(*args, **kwargs) -> dict[str, Any]:
+    raise RuntimeError("Route-local/RSEG updates were removed from this cleaned branch.")
 
 def train_from_config(
     cfg: dict[str, Any],
@@ -2392,30 +3224,110 @@ def train_from_config(
     eval_cfg = cfg.get("evaluation", {})
     offline_cfg = cfg.get("offline", {}) or {}
     offline_method = _offline_method(cfg)
+    allowed_methods = {"ppo", "bc_ppo", "bc-ppo", "awbc", "awbc_ppo", "awbc-ppo", "dapg"}
+    if offline_method not in allowed_methods:
+        raise ValueError(
+            f"Unsupported offline.method={offline_method!r}. "
+            "This cleaned branch keeps only ppo, bc_ppo, awbc/awbc_ppo, and dapg."
+        )
     model_cfg = cfg.get("model", {})
     critic_cfg = _decomposed_critic_config(cfg)
+    advantage_mode_name = str(critic_cfg.get("advantage_mode", "total")).strip().lower()
+    use_pomo_trajectory_advantage = advantage_mode_name in {"pomo_trajectory", "pomo", "trajectory_pomo"}
     use_decomposed_critic = bool(model_cfg.get("use_decomposed_critic", critic_cfg.get("use_decomposed_critic", True)))
+    if use_pomo_trajectory_advantage:
+        raise ValueError("POMO trajectory advantage was removed from this cleaned branch.")
+    if use_pomo_trajectory_advantage and use_decomposed_critic:
+        raise ValueError("advantage_mode=pomo_trajectory requires use_decomposed_critic=false")
     cfg.setdefault("env", {})["use_fast_env"] = True
     cfg["env"].setdefault("info_level", "light")
     run_name = str(cfg.get("run_name", "O2O_TERRAN_FULL"))
-    num_customers = int(cfg["data"].get("num_customers", 50))
-    num_cs = int(cfg["data"].get("num_charging_stations", 10))
+    data_cfg = cfg["data"]
+    num_customers = int(data_cfg.get("num_customers", 50))
+    num_cs = int(data_cfg.get("num_charging_stations", 10))
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    agent = Agent(
-        embedding_dim=int(model_cfg.get("embedding_dim", 256)),
-        tanh_clipping=float(model_cfg.get("tanh_clipping", 15.0)),
-        n_encode_layers=int(model_cfg.get("n_encode_layers", 2)),
-        device=device,
-        use_graph_token=bool(model_cfg.get("use_graph_token", True)),
-        use_dynamic_decision_encoder=bool(
-            model_cfg.get("use_dynamic_decision_encoder", False)
-        ),
-        dynamic_decision_heads=int(model_cfg.get("dynamic_decision_heads", 4)),
-        use_decomposed_critic=use_decomposed_critic,
-    ).to(device)
+    dynamic_decision_delta_k = bool(
+        model_cfg.get(
+            "dynamic_decision_delta_k",
+            model_cfg.get("dynamic_delta_k", model_cfg.get("delta_k", True)),
+        )
+    )
+    dynamic_decision_delta_v = bool(
+        model_cfg.get(
+            "dynamic_decision_delta_v",
+            model_cfg.get("dynamic_delta_v", model_cfg.get("delta_v", True)),
+        )
+    )
+    dynamic_decision_delta_action_key = bool(
+        model_cfg.get(
+            "dynamic_decision_delta_action_key",
+            model_cfg.get("dynamic_delta_action_key", model_cfg.get("delta_action_key", True)),
+        )
+    )
+    dynamic_decision_action_bias = bool(
+        model_cfg.get(
+            "dynamic_decision_action_bias",
+            model_cfg.get("dynamic_action_bias", model_cfg.get("action_bias", True)),
+        )
+    )
+
+    def _make_agent() -> Agent:
+        return Agent(
+            embedding_dim=int(model_cfg.get("embedding_dim", 256)),
+            tanh_clipping=float(model_cfg.get("tanh_clipping", 15.0)),
+            n_encode_layers=int(model_cfg.get("n_encode_layers", 2)),
+            device=device,
+            use_graph_token=bool(model_cfg.get("use_graph_token", True)),
+            use_dynamic_decision_encoder=bool(
+                model_cfg.get("use_dynamic_decision_encoder", False)
+            ),
+            dynamic_decision_heads=int(model_cfg.get("dynamic_decision_heads", 4)),
+            dynamic_decision_delta_k=dynamic_decision_delta_k,
+            dynamic_decision_delta_v=dynamic_decision_delta_v,
+            dynamic_decision_delta_action_key=dynamic_decision_delta_action_key,
+            dynamic_decision_action_bias=dynamic_decision_action_bias,
+            use_decomposed_critic=use_decomposed_critic,
+        ).to(device)
+
+    agent = _make_agent()
+    init_checkpoint_info: dict[str, Any] = {}
+    init_checkpoint_path = (
+        offline_cfg.get("init_checkpoint_path")
+        or offline_cfg.get("initial_checkpoint_path")
+        or train_cfg.get("init_checkpoint_path")
+        or train_cfg.get("initial_checkpoint_path")
+    )
+    if init_checkpoint_path:
+        init_checkpoint_info = _load_agent_checkpoint(
+            agent,
+            init_checkpoint_path,
+            device,
+            strict=bool(offline_cfg.get("init_checkpoint_strict", True)),
+        )
+    reference_agent: Agent | None = None
+    reference_checkpoint_info: dict[str, Any] = {}
+    hard_ref_kl_requested = _is_hard_method(offline_method) or float(
+        offline_cfg.get("hard_ref_kl_coef", offline_cfg.get("lambda_ref_kl", 0.0)) or 0.0
+    ) > 0.0
+    if hard_ref_kl_requested:
+        reference_agent = _make_agent()
+        reference_checkpoint_path = offline_cfg.get("reference_checkpoint_path") or init_checkpoint_path
+        if reference_checkpoint_path:
+            reference_checkpoint_info = _load_agent_checkpoint(
+                reference_agent,
+                reference_checkpoint_path,
+                device,
+                strict=bool(offline_cfg.get("reference_checkpoint_strict", True)),
+            )
+        else:
+            reference_agent.load_state_dict(agent.state_dict())
+            reference_checkpoint_info = {"checkpoint_path": "current_initial_agent"}
+        reference_agent.eval()
+        for parameter in reference_agent.parameters():
+            parameter.requires_grad_(False)
     optimizer = torch.optim.AdamW(
         agent.parameters(),
         lr=float(train_cfg.get("learning_rate", 1e-4)),
@@ -2423,12 +3335,9 @@ def train_from_config(
         weight_decay=float(train_cfg.get("weight_decay", 0.0)),
     )
 
-    initial_env_start = time.perf_counter()
-    envs, pool = make_envs(cfg, seed)
-    initial_env_pool_time_s = time.perf_counter() - initial_env_start
-
     gamma = float(train_cfg.get("gamma", 0.99))
     epochs = int(train_cfg.get("epochs", 500))
+    num_envs_cfg = int(train_cfg.get("num_envs_per_gpu", 128))
     rollout_steps = int(train_cfg.get("rollout_steps", 90))
     ppo_epochs = int(train_cfg.get("ppo_update_epochs", 3))
     num_minibatches = max(1, int(train_cfg.get("num_minibatches", 4)))
@@ -2441,9 +3350,70 @@ def train_from_config(
     ppo_step_chunk_size = int(train_cfg.get("ppo_step_chunk_size", 0) or 0)
     use_gae = bool(train_cfg.get("use_gae", True))
     gae_lambda = float(train_cfg.get("gae_lambda", 0.95))
+    use_route_segmented_gae = bool(train_cfg.get("use_route_segmented_gae", False))
+    if use_route_segmented_gae:
+        raise ValueError("Route-segmented GAE was removed from this cleaned branch.")
+    use_oracle_ordering_hint = bool(
+        train_cfg.get(
+            "use_oracle_ordering_hint",
+            offline_cfg.get("use_oracle_ordering_hint", False),
+        )
+    )
+    if use_oracle_ordering_hint:
+        raise ValueError("Oracle ordering hint was removed from this cleaned branch.")
+    oracle_refresh_logprobs = bool(
+        train_cfg.get(
+            "oracle_ordering_refresh_logprobs",
+            offline_cfg.get("oracle_ordering_refresh_logprobs", True),
+        )
+    )
     amp_enabled = _amp_enabled(train_cfg, device)
     scaler = _new_grad_scaler(amp_enabled)
     max_grad_norm = float(train_cfg.get("max_grad_norm", 1.0))
+    record_eval_median = str(
+        os.environ.get("O2O_RECORD_MEDIAN_EVAL", eval_cfg.get("record_median_eval", True))
+    ).strip().lower() not in {"0", "false", "no", "off"}
+
+    initial_env_start = time.perf_counter()
+    use_priority_sampler = bool(offline_cfg.get("use_priority_sampler", False))
+    if use_priority_sampler:
+        train_dataset_path = data_cfg.get("train_dataset_path") or data_cfg.get("instance_dataset_path") or data_cfg.get("fixed_train_path")
+        if train_dataset_path in (None, ""):
+            raise ValueError("HAPS priority sampler requires a fixed data.train_dataset_path")
+        base_pool = FixedDatasetInstancePool(
+            dataset_path=train_dataset_path,
+            num_customers=num_customers,
+            num_charging_stations=num_cs,
+            seed=seed,
+            sample_mode=str(data_cfg.get("train_sample_mode", "shuffle_cycle")),
+        )
+        _configure_dataset_reward_scale(cfg, base_pool)
+        references = _load_reference_metrics(offline_cfg.get("expert_solution_path") or offline_cfg.get("expert_csv_path"))
+        if not references:
+            raise ValueError("HAPS priority sampler requires offline.expert_solution_path with objective/vehicle references")
+        pool = HapsPrioritySampler(
+            base_pool,
+            references,
+            batch_size=num_envs_cfg,
+            seed=seed + int(offline_cfg.get("priority_seed_offset", 31_000)),
+            cfg=cfg,
+        )
+        pbrs_config = build_pbrs_config(cfg)
+        env_cfg = dict(cfg.get("env", {}) or {})
+        if bool(env_cfg.get("use_fast_env", True)):
+            env_cfg.setdefault("info_level", "light")
+        envs = [
+            make_terran_env(
+                instance_sampler=pool.sample,
+                n_traj=int(train_cfg.get("n_traj", 50)),
+                pbrs_config=pbrs_config,
+                **env_cfg,
+            )
+            for _ in range(num_envs_cfg)
+        ]
+    else:
+        envs, pool = make_envs(cfg, seed)
+    initial_env_pool_time_s = time.perf_counter() - initial_env_start
 
     out_root = REPO_ROOT / "results"
     ckpt_dir = out_root / "checkpoints" / f"Cus_{num_customers}_CS_{num_cs}" / run_name / f"seed_{seed}"
@@ -2460,6 +3430,8 @@ def train_from_config(
         "policy_loss",
         "value_loss",
         "entropy",
+        "approx_kl",
+        "clip_fraction",
         "value_loss_total",
         "value_loss_boundary",
         "value_loss_internal",
@@ -2478,6 +3450,20 @@ def train_from_config(
         "adv_internal_std",
         "adv_actor_mean",
         "adv_actor_std",
+        "pomo_reward_mean",
+        "pomo_reward_std",
+        "pomo_baseline_mean",
+        "pomo_within_reward_std_mean",
+        "pomo_within_reward_std_p10",
+        "pomo_within_reward_std_p90",
+        "pomo_valid_traj_ratio",
+        "pomo_success_traj_ratio",
+        "pomo_objective_used_ratio",
+        "pomo_adv_raw_mean",
+        "pomo_adv_raw_std",
+        "pomo_adv_norm_mean",
+        "pomo_adv_norm_std",
+        "pomo_valid_traj_count_mean",
         "boundary_distance_mean",
         "internal_distance_mean",
         "boundary_share",
@@ -2498,12 +3484,74 @@ def train_from_config(
         "mixed_precision",
         "use_gae",
         "gae_lambda",
+        "use_route_segmented_gae",
+        "route_boundary_count_mean",
+        "route_boundary_step_ratio",
+        "expert_replay_success_rate",
+        "expert_action_valid_ratio",
+        "expert_env_replay_obj_error_mean",
+        "expert_env_replay_obj_error_max",
+        "expert_route_count_mean",
+        "route_set_num_permutations_sampled",
+        "route_set_target_valid_ratio",
+        "route_local_customer_count_mean",
+        "route_local_cs_candidate_count_mean",
+        "route_local_objective_mean",
+        "same_route_examples",
+        "same_route_positive_pairs_mean",
+        "same_route_negative_pairs_mean",
+        "rseg_structure_examples",
+        "rseg_route_count_mean",
+        "rseg_route_count_max",
+        "rseg_route_start_count_mean",
+        "rseg_progress_baselines",
+        "priority_mean",
+        "priority_std",
+        "priority_min",
+        "priority_max",
+        "sampled_priority_mean",
+        "gap_score_mean",
+        "gap_score_std",
+        "vehicle_score_mean",
+        "vehicle_score_std",
+        "sampled_gap_mean",
+        "sampled_vehicle_gap_mean",
+        "priority_uniform_fraction",
+        "priority_weighted_fraction",
+        "unique_instance_ratio",
+        "stale_bonus_mean",
+        "num_priority_updates_mean",
         "bc_loss",
         "bc_accuracy",
+        "bc_action_accuracy",
         "bc_entropy",
         "bc_coef",
+        "route_start_loss",
+        "internal_successor_loss",
+        "route_close_loss",
+        "depot_multilabel_active_ratio",
+        "start_target_set_size_mean",
+        "start_target_set_size_max",
+        "awbc_loss",
+        "awbc_weight_mean",
+        "awbc_weight_std",
+        "awbc_active_ratio",
+        "awbc_expert_better_ratio",
+        "hard_ref_kl_loss",
+        "hard_ref_match",
+        "hard_ref_bc_action_accuracy",
+        "hard_ref_entropy",
+        "hard_ref_kl_coef",
+        "hard_ref_temperature",
+        "hard_demo_loss",
+        "hard_demo_coef",
+        "hard_eta",
+        "hard_normalize",
+        "hard_baseline",
         "dapg_demo_gate_mean",
         "dapg_demo_gate_std",
+        "dapg_demo_active_ratio",
+        "expert_better_ratio",
         "dapg_memory_better_rate",
         "dapg_memory_gap_mean",
         "bafipo_pref_loss",
@@ -2541,6 +3589,75 @@ def train_from_config(
         "route_bc_count",
         "route_bc_step_count",
         "route_bc_avg_route_len",
+        "same_route_loss",
+        "same_route_accuracy",
+        "same_route_pos_accuracy",
+        "same_route_neg_accuracy",
+        "same_route_pairs",
+        "same_route_coef",
+        "rseg_loss",
+        "rseg_edge_loss",
+        "rseg_edge_accuracy",
+        "rseg_edge_steps",
+        "rseg_start_loss",
+        "rseg_start_recall",
+        "rseg_start_precision",
+        "rseg_start_jaccard",
+        "rseg_close_loss",
+        "rseg_close_accuracy",
+        "rseg_close_positive_rate",
+        "rseg_count_loss",
+        "rseg_count_mae",
+        "rseg_count_pred_mean",
+        "rseg_progress_penalty_mean",
+        "rseg_progress_active_ratio",
+        "rseg_progress_gap_mean",
+        "rseg_progress_points",
+        "rseg_progress_coef",
+        "route_quality_reward_mean",
+        "route_quality_reward_sum",
+        "route_quality_modified_steps",
+        "route_quality_penalty_mean",
+        "route_quality_gap_km_mean",
+        "route_quality_gap_scaled_mean",
+        "route_quality_active_ratio",
+        "route_quality_routes",
+        "route_quality_cache_hit_rate",
+        "route_quality_cache_size",
+        "route_quality_coef",
+        "oracle_ordering_hint_enabled",
+        "oracle_ordering_hint_routes",
+        "oracle_ordering_hint_changed_routes",
+        "oracle_ordering_hint_route_changed_ratio",
+        "oracle_ordering_hint_customer_steps",
+        "oracle_ordering_hint_flagged_steps",
+        "oracle_ordering_hint_step_ratio",
+        "oracle_ordering_hint_action_match_ratio",
+        "notclose_loss",
+        "notclose_points",
+        "notclose_candidate_points",
+        "notclose_active_ratio",
+        "notclose_depot_action_ratio",
+        "notclose_avg_route_size_mean",
+        "notclose_coef",
+        "member_loss",
+        "member_loss_points",
+        "member_candidate_points",
+        "member_loss_active_ratio",
+        "member_matched_route_count",
+        "member_matched_traj_count",
+        "member_k_equal_traj_count",
+        "member_k2_matched_jaccard",
+        "member_k2_match_gap",
+        "member_coef",
+        "anchor_loss",
+        "anchor_loss_points",
+        "anchor_candidate_points",
+        "anchor_violation_ratio",
+        "anchor_k_equal_traj_count",
+        "anchor_k2_matched_jaccard",
+        "anchor_k2_match_gap",
+        "anchor_coef",
         "sl_route_loss",
         "sl_route_ratio_mean",
         "sl_route_ratio_std",
@@ -2603,8 +3720,14 @@ def train_from_config(
         "train_avg_vehicle_count",
         "train_avg_served_customers",
         "eval_avg_objective_distance_km",
+        "eval_avg_min_objective_distance_km",
+        "eval_avg_median_objective_distance_km",
         "eval_avg_vehicle_count",
+        "eval_avg_min_vehicle_count",
+        "eval_avg_median_vehicle_count",
         "eval_feasible_rate",
+        "eval_traj_feasible_rate",
+        "eval_avg_feasible_traj_count",
         "eval_avg_runtime_s",
         "eval_num_instances",
         "eval_n_traj",
@@ -2614,12 +3737,44 @@ def train_from_config(
         "eval_info_level",
         "eval_save_routes",
         "eval_status",
+        "eval_gap_mean",
+        "eval_gap_median",
+        "eval_gap_p75",
+        "eval_gap_p90",
+        "eval_gap_p95",
+        "eval_gap_p99",
+        "eval_gap_gt50_count",
+        "eval_gap_gt100_count",
+        "eval_top10_hard_gap_mean",
+        "eval_vehicle_gap_mean",
+        "eval_vehicle_gap_median",
+        "eval_vehicle_gap_p90",
+        "eval_vehicle_gap_p95",
+        "eval_vehicle_gap_gt0_count",
+        *[
+            field
+            for k in range(1, 5)
+            for field in (
+                f"eval_gap_expertK{k}_mean",
+                f"eval_obj_expertK{k}_mean",
+                f"eval_gap_expertK{k}_count",
+                f"eval_gap_policyK{k}_mean",
+                f"eval_obj_policyK{k}_mean",
+                f"eval_gap_policyK{k}_count",
+            )
+        ],
     ]
     eval_fields = [
         "epoch",
         "eval_avg_objective_distance_km",
+        "eval_avg_min_objective_distance_km",
+        "eval_avg_median_objective_distance_km",
         "eval_avg_vehicle_count",
+        "eval_avg_min_vehicle_count",
+        "eval_avg_median_vehicle_count",
         "eval_feasible_rate",
+        "eval_traj_feasible_rate",
+        "eval_avg_feasible_traj_count",
         "eval_avg_runtime_s",
         "eval_num_instances",
         "eval_n_traj",
@@ -2629,15 +3784,48 @@ def train_from_config(
         "eval_info_level",
         "eval_save_routes",
         "eval_status",
+        "eval_gap_mean",
+        "eval_gap_median",
+        "eval_gap_p75",
+        "eval_gap_p90",
+        "eval_gap_p95",
+        "eval_gap_p99",
+        "eval_gap_gt50_count",
+        "eval_gap_gt100_count",
+        "eval_top10_hard_gap_mean",
+        "eval_vehicle_gap_mean",
+        "eval_vehicle_gap_median",
+        "eval_vehicle_gap_p90",
+        "eval_vehicle_gap_p95",
+        "eval_vehicle_gap_gt0_count",
+        *[
+            field
+            for k in range(1, 5)
+            for field in (
+                f"eval_gap_expertK{k}_mean",
+                f"eval_obj_expertK{k}_mean",
+                f"eval_gap_expertK{k}_count",
+                f"eval_gap_policyK{k}_mean",
+                f"eval_obj_policyK{k}_mean",
+                f"eval_gap_policyK{k}_count",
+            )
+        ],
     ]
+    if not record_eval_median:
+        median_fields = {
+            "eval_avg_median_objective_distance_km",
+            "eval_avg_median_vehicle_count",
+        }
+        train_fields = [field for field in train_fields if field not in median_fields]
+        eval_fields = [field for field in eval_fields if field not in median_fields]
 
     with (
         log_path.open("w", newline="", encoding="utf-8") as f,
         eval_log_path.open("w", newline="", encoding="utf-8") as ef,
         debug_log_path.open("w", encoding="utf-8") as df,
     ):
-        writer = csv.DictWriter(f, fieldnames=train_fields)
-        eval_writer = csv.DictWriter(ef, fieldnames=eval_fields)
+        writer = csv.DictWriter(f, fieldnames=train_fields, extrasaction="ignore")
+        eval_writer = csv.DictWriter(ef, fieldnames=eval_fields, extrasaction="ignore")
         writer.writeheader()
         eval_writer.writeheader()
         expert_buffer = _load_expert_buffer(cfg, seed, debug_enabled, df)
@@ -2654,15 +3842,33 @@ def train_from_config(
             f"n_encode_layers={model_cfg.get('n_encode_layers', 2)} "
             f"use_graph_token={model_cfg.get('use_graph_token', True)} "
             f"use_dynamic_decision_encoder={model_cfg.get('use_dynamic_decision_encoder', False)} "
+            f"dde_flags=k{int(dynamic_decision_delta_k)}_v{int(dynamic_decision_delta_v)}_ak{int(dynamic_decision_delta_action_key)}_bias{int(dynamic_decision_action_bias)} "
             f"use_decomposed_critic={use_decomposed_critic} "
-            f"advantage_mode={critic_cfg.get('advantage_mode', 'total')} "
+            f"advantage_mode={advantage_mode_name} "
             f"mixed_precision={amp_enabled} "
             f"offline_method={offline_method} use_gae={use_gae} gae_lambda={gae_lambda} "
+            f"use_route_segmented_gae={use_route_segmented_gae} "
+            f"use_oracle_ordering_hint={use_oracle_ordering_hint} "
+            f"use_priority_sampler={use_priority_sampler} "
             f"expert_steps={expert_buffer.num_steps if expert_buffer is not None else 0} "
             f"initial_env_pool_time_s={initial_env_pool_time_s:.3f} "
             f"eval_interval={eval_interval} eval_n_traj={eval_cfg.get('eval_n_traj', 50)} "
             f"eval_batch_size={eval_cfg.get('eval_batch_size', 1000)}",
         )
+        if init_checkpoint_info or reference_checkpoint_info:
+            _debug_log(
+                debug_enabled,
+                df,
+                "[CheckpointInit] "
+                f"init={init_checkpoint_info.get('checkpoint_path', '')} "
+                f"init_epoch={init_checkpoint_info.get('epoch', '')} "
+                f"reference={reference_checkpoint_info.get('checkpoint_path', '')} "
+                f"reference_epoch={reference_checkpoint_info.get('epoch', '')} "
+                f"init_missing={len(init_checkpoint_info.get('missing_keys', [])) if init_checkpoint_info else 0} "
+                f"init_unexpected={len(init_checkpoint_info.get('unexpected_keys', [])) if init_checkpoint_info else 0} "
+                f"ref_missing={len(reference_checkpoint_info.get('missing_keys', [])) if reference_checkpoint_info else 0} "
+                f"ref_unexpected={len(reference_checkpoint_info.get('unexpected_keys', [])) if reference_checkpoint_info else 0}",
+            )
         for epoch in range(1, epochs + 1):
             epoch_start = time.perf_counter()
             pbrs_scale = pbrs_scale_for_epoch(cfg, epoch, epochs)
@@ -2670,10 +3876,13 @@ def train_from_config(
             agent.train()
             offline_updates = 0
             bc_info: dict[str, Any] = {}
+            haps_info: dict[str, Any] = {}
             sl_info: dict[str, Any] = {}
             bafipo_info: dict[str, Any] = {}
             gcbpo_info: dict[str, Any] = {}
             adv_info: dict[str, Any] = {}
+            progress_info: dict[str, Any] = {}
+            ppo_stats_info: dict[str, Any] = {"approx_kl": "", "clip_fraction": ""}
             decomposed_info: dict[str, Any] = {
                 "value_loss_total": 0.0,
                 "value_loss_boundary": 0.0,
@@ -2693,6 +3902,20 @@ def train_from_config(
                 "adv_internal_std": 0.0,
                 "adv_actor_mean": 0.0,
                 "adv_actor_std": 0.0,
+                "pomo_reward_mean": "",
+                "pomo_reward_std": "",
+                "pomo_baseline_mean": "",
+                "pomo_within_reward_std_mean": "",
+                "pomo_within_reward_std_p10": "",
+                "pomo_within_reward_std_p90": "",
+                "pomo_valid_traj_ratio": "",
+                "pomo_success_traj_ratio": "",
+                "pomo_objective_used_ratio": "",
+                "pomo_adv_raw_mean": "",
+                "pomo_adv_raw_std": "",
+                "pomo_adv_norm_mean": "",
+                "pomo_adv_norm_std": "",
+                "pomo_valid_traj_count_mean": "",
                 "boundary_distance_mean": 0.0,
                 "internal_distance_mean": 0.0,
                 "boundary_share": 0.0,
@@ -2726,6 +3949,12 @@ def train_from_config(
             minibatches = min(num_minibatches, max(num_envs, 1))
             ppo_update_time_s = 0.0
             rollout_timings: dict[str, Any] = {}
+            route_boundary_info: dict[str, Any] = {
+                "route_boundary_count_mean": "",
+                "route_boundary_step_ratio": "",
+            }
+            if use_priority_sampler and hasattr(pool, "begin_epoch"):
+                pool.begin_epoch(epoch)
 
             if do_bc_warmup:
                 ppo_start = time.perf_counter()
@@ -2753,26 +3982,54 @@ def train_from_config(
                     seed=seed + epoch * 100_000,
                     profile_timing=profile_timing,
                 )
+                if use_priority_sampler and hasattr(pool, "update_from_rollout"):
+                    haps_info = pool.update_from_rollout(batch, epoch=epoch)
                 decomposed_returns: dict[str, torch.Tensor] | None = None
-                if use_decomposed_critic:
+                if use_pomo_trajectory_advantage:
+                    returns, advantages, pomo_info = _compute_pomo_trajectory_advantages(
+                        batch,
+                        envs,
+                        cfg,
+                        device,
+                    )
+                    decomposed_info.update(pomo_info)
+                elif use_decomposed_critic:
                     decomposed_returns, decomposed_advantages, advantages, decomposed_info = _compute_decomposed_returns_advantages(
                         batch,
                         gamma=gamma,
                         gae_lambda=gae_lambda,
                         use_gae=use_gae,
                         cfg=cfg,
+                        route_segmented=use_route_segmented_gae,
                     )
                     returns = decomposed_returns
                     decomposed_info.update(_decomposed_value_diagnostics(batch, decomposed_returns))
                 elif use_gae:
-                    returns, advantages = _compute_gae_returns(batch, gamma=gamma, gae_lambda=gae_lambda)
+                    returns, advantages = _compute_gae_returns(
+                        batch,
+                        gamma=gamma,
+                        gae_lambda=gae_lambda,
+                        route_segmented=use_route_segmented_gae,
+                    )
                     advantages = _normalize_valid(advantages, batch.valid)
                 else:
                     returns = compute_returns(batch.rewards, batch.dones, gamma=gamma)
                     values = _value_head(batch.values, 0)
                     advantages = returns - values
                     advantages = _normalize_valid(advantages, batch.valid)
+                if getattr(batch, "route_boundaries", None) is not None:
+                    valid_boundary = batch.route_boundaries & batch.valid
+                    valid_count = int(batch.valid.sum().detach().cpu().item())
+                    traj_count = max(int(batch.valid.size(1) * batch.valid.size(2)), 1)
+                    boundary_count = int(valid_boundary.sum().detach().cpu().item())
+                    route_boundary_info = {
+                        "route_boundary_count_mean": boundary_count / traj_count,
+                        "route_boundary_step_ratio": boundary_count / max(valid_count, 1),
+                    }
                 dapg_enabled = expert_buffer is not None and _is_dapg_method(offline_method)
+                awbc_enabled = expert_buffer is not None and _is_awbc_method(offline_method)
+                hard_enabled = expert_buffer is not None and _is_hard_method(offline_method)
+                bc_aux_enabled = expert_buffer is not None and _is_bc_aux_method(offline_method)
                 bafipo_enabled = expert_buffer is not None and _is_bafipo_method(offline_method)
                 gcbpo_enabled = expert_buffer is not None and _is_gcbpo_method(offline_method)
                 dapg_demo_gate = 1.0
@@ -2878,11 +4135,52 @@ def train_from_config(
                         dapg_adv_scale = max(float(valid_adv.max().detach().cpu().item()), 0.0)
                     dapg_demo_coef = max(dapg_base_coef * (dapg_decay ** dapg_iteration), dapg_min_coef)
                     dapg_demo_coef *= dapg_adv_scale * float(dapg_demo_gate)
+                bc_aux_coef = float(offline_coef)
                 dapg_bc_batch_size = int(offline_cfg.get("bc_batch_size", 256))
                 dapg_bc_losses: list[float] = []
                 dapg_bc_accs: list[float] = []
+                dapg_bc_action_accs: list[float] = []
                 dapg_bc_entropies: list[float] = []
+                route_start_losses: list[float] = []
+                internal_successor_losses: list[float] = []
+                route_close_losses: list[float] = []
+                depot_multilabel_active_ratios: list[float] = []
+                start_target_size_means: list[float] = []
+                start_target_size_maxes: list[float] = []
                 dapg_bc_steps = 0
+                awbc_weight_means: list[float] = []
+                awbc_weight_stds: list[float] = []
+                awbc_active_ratios: list[float] = []
+                awbc_expert_better_ratios: list[float] = []
+                awbc_coef = float(offline_cfg.get("awbc_coef", offline_cfg.get("bc_coef", 0.05)))
+                awbc_eta = float(offline_cfg.get("awbc_eta", 0.05))
+                awbc_normalize = str(offline_cfg.get("awbc_normalize", "p95"))
+                awbc_baseline = str(offline_cfg.get("awbc_baseline", "batch_mean"))
+                awbc_policy_baseline = (
+                    _policy_mean_successful_objective(batch)
+                    if awbc_baseline.lower() in {"mean_successful", "mean", "avg_successful", "average_successful"}
+                    else None
+                )
+                hard_ref_kl_coef = float(offline_cfg.get("hard_ref_kl_coef", offline_cfg.get("lambda_ref_kl", 0.005 if hard_enabled else 0.0)))
+                hard_ref_batch_size = int(offline_cfg.get("hard_ref_batch_size", offline_cfg.get("bc_batch_size", 512)))
+                hard_ref_temperature = float(offline_cfg.get("hard_ref_temperature", 1.0))
+                hard_ref_kl_enabled = hard_enabled and reference_agent is not None and hard_ref_kl_coef > 0.0
+                hard_demo_coef = float(offline_cfg.get("hard_demo_coef", offline_cfg.get("lambda_demo", 0.10 if _is_hard_full_method(offline_method) else 0.0)))
+                hard_demo_batch_size = int(offline_cfg.get("hard_demo_batch_size", offline_cfg.get("bc_batch_size", 512)))
+                hard_eta = float(offline_cfg.get("hard_eta", offline_cfg.get("hard_eta_total", offline_cfg.get("awbc_eta", 0.10))))
+                hard_normalize = str(offline_cfg.get("hard_normalize", offline_cfg.get("hard_component_weight_mode", offline_cfg.get("awbc_normalize", "p95"))))
+                hard_baseline = str(offline_cfg.get("hard_baseline", offline_cfg.get("awbc_baseline", "mean_successful")))
+                hard_policy_baseline = (
+                    _policy_mean_successful_objective(batch)
+                    if hard_baseline.lower() in {"mean_successful", "mean", "avg_successful", "average_successful"}
+                    else None
+                )
+                hard_demo_enabled = hard_enabled and _is_hard_full_method(offline_method) and hard_demo_coef > 0.0
+                hard_ref_kl_losses: list[float] = []
+                hard_ref_matches: list[float] = []
+                hard_ref_action_accs: list[float] = []
+                hard_ref_entropies: list[float] = []
+                hard_demo_losses: list[float] = []
                 bafipo_pref_coef = float(_bafipo_config(cfg)["pref_coef"])
                 bafipo_minibatches_per_ppo_epoch = int(offline_cfg.get("bafipo_minibatches_per_ppo_epoch", 0) or 0)
                 bafipo_pref_losses: list[float] = []
@@ -2909,7 +4207,36 @@ def train_from_config(
                 sl_adv_means: list[float] = []
                 sl_adv_stds: list[float] = []
                 sl_route_counts: list[float] = []
+                notclose_coef = float(offline_cfg.get("notclose_coef", offline_cfg.get("premature_close_coef", 0.0)) or 0.0)
+                notclose_losses: list[float] = []
+                notclose_points: list[float] = []
+                notclose_candidate_points: list[float] = []
+                notclose_active_ratios: list[float] = []
+                notclose_depot_action_ratios: list[float] = []
+                notclose_avg_route_sizes: list[float] = []
+                member_coef = float(offline_cfg.get("member_coef", offline_cfg.get("onpolicy_member_coef", 0.0)) or 0.0)
+                member_targets = (
+                    _prepare_onpolicy_member_targets(batch, envs, expert_buffer, cfg)
+                    if member_coef > 0.0 and expert_buffer is not None
+                    else None
+                )
+                member_losses: list[float] = []
+                member_loss_points: list[float] = []
+                member_candidate_points: list[float] = []
+                member_active_ratios: list[float] = []
+                anchor_coef = float(offline_cfg.get("anchor_coef", offline_cfg.get("onpolicy_anchor_coef", 0.0)) or 0.0)
+                anchor_targets = (
+                    _prepare_onpolicy_anchor_targets(batch, envs, expert_buffer, cfg)
+                    if anchor_coef > 0.0 and expert_buffer is not None
+                    else None
+                )
+                anchor_losses: list[float] = []
+                anchor_loss_points: list[float] = []
+                anchor_candidate_points: list[float] = []
+                anchor_violation_ratios: list[float] = []
                 decomposed_loss_infos: list[dict[str, float]] = []
+                approx_kls: list[float] = []
+                clip_fracs: list[float] = []
                 frro_expert_losses: list[float] = []
                 frro_expert_ratio_means: list[float] = []
                 frro_expert_ratio_stds: list[float] = []
@@ -2953,22 +4280,92 @@ def train_from_config(
                                             step_end=step_end,
                                         )
                                         decomposed_loss_infos.append(value_info)
+                                    elif use_pomo_trajectory_advantage:
+                                        loss, policy_loss, value_loss, entropy, ppo_stats = _evaluate_policy_loss_policy_only_with_stats(
+                                            agent,
+                                            batch,
+                                            advantages.detach(),
+                                            cfg,
+                                            env_indices=env_indices,
+                                            step_start=step_start,
+                                            step_end=step_end,
+                                        )
+                                        approx_kls.append(float(ppo_stats["approx_kl"]))
+                                        clip_fracs.append(float(ppo_stats["clip_fraction"]))
                                     else:
-                                        loss, policy_loss, value_loss, entropy = evaluate_policy_loss(
+                                        loss, policy_loss, value_loss, entropy, ppo_stats = _evaluate_policy_loss_with_stats(
                                             agent,
                                             batch,
                                             returns,
                                             advantages.detach(),
                                             cfg,
-                                            device,
                                             env_indices=env_indices,
                                             step_start=step_start,
                                             step_end=step_end,
                                         )
+                                        approx_kls.append(float(ppo_stats["approx_kl"]))
+                                        clip_fracs.append(float(ppo_stats["clip_fraction"]))
                                 _backward(loss * chunk_weight / group_size, scaler, amp_enabled)
                                 weighted_policy += policy_loss.item() * chunk_weight
                                 weighted_value += value_loss.item() * chunk_weight
                                 weighted_entropy += entropy.item() * chunk_weight
+                                if notclose_coef > 0.0 and expert_buffer is not None:
+                                    with _autocast_context(device, amp_enabled):
+                                        notclose_loss, notclose_info = _compute_premature_close_loss(
+                                            agent,
+                                            batch,
+                                            envs,
+                                            expert_buffer,
+                                            cfg,
+                                            env_indices,
+                                            device,
+                                            step_start=step_start,
+                                            step_end=step_end,
+                                        )
+                                    if int(notclose_info.get("notclose_points", 0)) > 0:
+                                        _backward(notclose_coef * notclose_loss * chunk_weight / group_size, scaler, amp_enabled)
+                                    notclose_losses.append(float(notclose_info.get("notclose_loss", 0.0)))
+                                    notclose_points.append(float(notclose_info.get("notclose_points", 0.0)))
+                                    notclose_candidate_points.append(float(notclose_info.get("notclose_candidate_points", 0.0)))
+                                    notclose_active_ratios.append(float(notclose_info.get("notclose_active_ratio", 0.0)))
+                                    notclose_depot_action_ratios.append(float(notclose_info.get("notclose_depot_action_ratio", 0.0)))
+                                    notclose_avg_route_sizes.append(float(notclose_info.get("notclose_avg_route_size_mean", 0.0)))
+                                if member_coef > 0.0 and member_targets is not None:
+                                    with _autocast_context(device, amp_enabled):
+                                        member_loss, member_info = _compute_onpolicy_member_loss(
+                                            agent,
+                                            batch,
+                                            member_targets,
+                                            cfg,
+                                            env_indices,
+                                            device,
+                                            step_start=step_start,
+                                            step_end=step_end,
+                                        )
+                                    if int(member_info.get("member_loss_points", 0)) > 0:
+                                        _backward(member_coef * member_loss * chunk_weight / group_size, scaler, amp_enabled)
+                                    member_losses.append(float(member_info.get("member_loss", 0.0)))
+                                    member_loss_points.append(float(member_info.get("member_loss_points", 0.0)))
+                                    member_candidate_points.append(float(member_info.get("member_candidate_points", 0.0)))
+                                    member_active_ratios.append(float(member_info.get("member_loss_active_ratio", 0.0)))
+                                if anchor_coef > 0.0 and anchor_targets is not None:
+                                    with _autocast_context(device, amp_enabled):
+                                        anchor_loss, anchor_info = _compute_onpolicy_anchor_loss(
+                                            agent,
+                                            batch,
+                                            anchor_targets,
+                                            cfg,
+                                            env_indices,
+                                            device,
+                                            step_start=step_start,
+                                            step_end=step_end,
+                                        )
+                                    if int(anchor_info.get("anchor_loss_points", 0)) > 0:
+                                        _backward(anchor_coef * anchor_loss * chunk_weight / group_size, scaler, amp_enabled)
+                                    anchor_losses.append(float(anchor_info.get("anchor_loss", 0.0)))
+                                    anchor_loss_points.append(float(anchor_info.get("anchor_loss_points", 0.0)))
+                                    anchor_candidate_points.append(float(anchor_info.get("anchor_candidate_points", 0.0)))
+                                    anchor_violation_ratios.append(float(anchor_info.get("anchor_violation_ratio", 0.0)))
                             sl_coef = float(offline_cfg.get("sl_coef", offline_cfg.get("route_loss_coef", 0.10)))
                             if sl_enabled and route_adv_tensor is not None and route_success_tensor is not None:
                                 with _autocast_context(device, amp_enabled):
@@ -3077,8 +4474,44 @@ def train_from_config(
                             _backward(float(dapg_demo_coef) * demo_loss, scaler, amp_enabled)
                             dapg_bc_losses.append(float(demo_info["bc_loss"]))
                             dapg_bc_accs.append(float(demo_info["bc_accuracy"]))
+                            dapg_bc_action_accs.append(float(demo_info.get("bc_action_accuracy", demo_info["bc_accuracy"])))
                             dapg_bc_entropies.append(float(demo_info["bc_entropy"]))
+                            route_start_losses.append(float(demo_info.get("route_start_loss", 0.0)))
+                            internal_successor_losses.append(float(demo_info.get("internal_successor_loss", 0.0)))
+                            route_close_losses.append(float(demo_info.get("route_close_loss", 0.0)))
+                            depot_multilabel_active_ratios.append(float(demo_info.get("depot_multilabel_active_ratio", 0.0)))
+                            start_target_size_means.append(float(demo_info.get("start_target_set_size_mean", 0.0)))
+                            start_target_size_maxes.append(float(demo_info.get("start_target_set_size_max", 0.0)))
                             dapg_bc_steps += int(demo_info["bc_steps"])
+                            offline_updates += 1
+                        if awbc_enabled and awbc_coef > 0.0 and expert_buffer is not None:
+                            with _autocast_context(device, amp_enabled):
+                                demo_loss, demo_info = compute_awbc_loss(
+                                    agent,
+                                    expert_buffer,
+                                    batch_size=dapg_bc_batch_size,
+                                    device=device,
+                                    eta=awbc_eta,
+                                    normalize=awbc_normalize,
+                                    baseline=awbc_baseline,
+                                    baseline_objective=awbc_policy_baseline,
+                                )
+                            _backward(float(awbc_coef) * demo_loss, scaler, amp_enabled)
+                            dapg_bc_losses.append(float(demo_info["bc_loss"]))
+                            dapg_bc_accs.append(float(demo_info["bc_accuracy"]))
+                            dapg_bc_action_accs.append(float(demo_info.get("bc_action_accuracy", demo_info["bc_accuracy"])))
+                            dapg_bc_entropies.append(float(demo_info["bc_entropy"]))
+                            route_start_losses.append(float(demo_info.get("route_start_loss", 0.0)))
+                            internal_successor_losses.append(float(demo_info.get("internal_successor_loss", 0.0)))
+                            route_close_losses.append(float(demo_info.get("route_close_loss", 0.0)))
+                            depot_multilabel_active_ratios.append(float(demo_info.get("depot_multilabel_active_ratio", 0.0)))
+                            start_target_size_means.append(float(demo_info.get("start_target_set_size_mean", 0.0)))
+                            start_target_size_maxes.append(float(demo_info.get("start_target_set_size_max", 0.0)))
+                            dapg_bc_steps += int(demo_info["bc_steps"])
+                            awbc_weight_means.append(float(demo_info["awbc_weight_mean"]))
+                            awbc_weight_stds.append(float(demo_info["awbc_weight_std"]))
+                            awbc_active_ratios.append(float(demo_info["awbc_active_ratio"]))
+                            awbc_expert_better_ratios.append(float(demo_info["awbc_expert_better_ratio"]))
                             offline_updates += 1
                         _optimizer_step(optimizer, agent, max_grad_norm, scaler, amp_enabled)
                         losses.append((group_policy, group_value, group_entropy))
@@ -3090,15 +4523,80 @@ def train_from_config(
                         "value_consistency_loss",
                     ):
                         decomposed_info[key] = float(np.mean([info[key] for info in decomposed_loss_infos]))
-                if dapg_enabled:
+                ppo_stats_info = {
+                    "approx_kl": float(np.mean(approx_kls)) if approx_kls else 0.0,
+                    "clip_fraction": float(np.mean(clip_fracs)) if clip_fracs else 0.0,
+                }
+                if dapg_enabled or awbc_enabled:
                     bc_info = {
                         "bc_loss": float(np.mean(dapg_bc_losses)) if dapg_bc_losses else 0.0,
                         "bc_accuracy": float(np.mean(dapg_bc_accs)) if dapg_bc_accs else 0.0,
+                        "bc_action_accuracy": float(np.mean(dapg_bc_action_accs)) if dapg_bc_action_accs else 0.0,
                         "bc_entropy": float(np.mean(dapg_bc_entropies)) if dapg_bc_entropies else 0.0,
                         "bc_steps": int(dapg_bc_steps),
-                        "bc_coef": float(dapg_demo_coef),
+                        "bc_coef": float(awbc_coef if awbc_enabled else dapg_demo_coef),
+                        "route_start_loss": float(np.mean(route_start_losses)) if route_start_losses else 0.0,
+                        "internal_successor_loss": float(np.mean(internal_successor_losses)) if internal_successor_losses else 0.0,
+                        "route_close_loss": float(np.mean(route_close_losses)) if route_close_losses else 0.0,
+                        "depot_multilabel_active_ratio": float(np.mean(depot_multilabel_active_ratios)) if depot_multilabel_active_ratios else 0.0,
+                        "start_target_set_size_mean": float(np.mean(start_target_size_means)) if start_target_size_means else 0.0,
+                        "start_target_set_size_max": float(np.max(start_target_size_maxes)) if start_target_size_maxes else 0.0,
                         "offline_updates": int(offline_updates),
+                        "awbc_loss": float(np.mean(dapg_bc_losses)) if (awbc_enabled and dapg_bc_losses) else 0.0,
+                        "awbc_weight_mean": float(np.mean(awbc_weight_means)) if awbc_weight_means else 0.0,
+                        "awbc_weight_std": float(np.mean(awbc_weight_stds)) if awbc_weight_stds else 0.0,
+                        "awbc_active_ratio": float(np.mean(awbc_active_ratios)) if awbc_active_ratios else 0.0,
+                        "awbc_expert_better_ratio": float(np.mean(awbc_expert_better_ratios)) if awbc_expert_better_ratios else 0.0,
+                        "hard_ref_kl_loss": float(np.mean(hard_ref_kl_losses)) if hard_ref_kl_losses else 0.0,
+                        "hard_ref_match": float(np.mean(hard_ref_matches)) if hard_ref_matches else 0.0,
+                        "hard_ref_bc_action_accuracy": float(np.mean(hard_ref_action_accs)) if hard_ref_action_accs else 0.0,
+                        "hard_ref_entropy": float(np.mean(hard_ref_entropies)) if hard_ref_entropies else 0.0,
+                        "hard_ref_kl_coef": float(hard_ref_kl_coef),
+                        "hard_ref_temperature": float(hard_ref_temperature),
+                        "hard_demo_loss": float(np.mean(hard_demo_losses)) if hard_demo_losses else 0.0,
+                        "hard_demo_coef": float(hard_demo_coef if hard_demo_enabled else 0.0),
+                        "hard_eta": float(hard_eta),
+                        "hard_normalize": hard_normalize,
+                        "hard_baseline": hard_baseline,
                     }
+                if notclose_coef > 0.0:
+                    bc_info.update(
+                        {
+                            "notclose_loss": float(np.mean(notclose_losses)) if notclose_losses else 0.0,
+                            "notclose_points": int(np.sum(notclose_points)) if notclose_points else 0,
+                            "notclose_candidate_points": int(np.sum(notclose_candidate_points)) if notclose_candidate_points else 0,
+                            "notclose_active_ratio": float(np.mean(notclose_active_ratios)) if notclose_active_ratios else 0.0,
+                            "notclose_depot_action_ratio": float(np.mean(notclose_depot_action_ratios)) if notclose_depot_action_ratios else 0.0,
+                            "notclose_avg_route_size_mean": float(np.mean(notclose_avg_route_sizes)) if notclose_avg_route_sizes else 0.0,
+                            "notclose_coef": float(notclose_coef),
+                        }
+                    )
+                if member_coef > 0.0:
+                    member_info_for_epoch = _zero_member_info(member_coef, member_targets)
+                    member_points_sum = int(np.sum(member_loss_points)) if member_loss_points else 0
+                    member_candidates_sum = int(np.sum(member_candidate_points)) if member_candidate_points else 0
+                    member_info_for_epoch.update(
+                        {
+                            "member_loss": float(np.mean(member_losses)) if member_losses else 0.0,
+                            "member_loss_points": member_points_sum,
+                            "member_candidate_points": member_candidates_sum,
+                            "member_loss_active_ratio": float(member_points_sum / max(member_candidates_sum, 1)),
+                        }
+                    )
+                    bc_info.update(member_info_for_epoch)
+                if anchor_coef > 0.0:
+                    anchor_info_for_epoch = _zero_anchor_info(anchor_coef, anchor_targets)
+                    anchor_points_sum = int(np.sum(anchor_loss_points)) if anchor_loss_points else 0
+                    anchor_candidates_sum = int(np.sum(anchor_candidate_points)) if anchor_candidate_points else 0
+                    anchor_info_for_epoch.update(
+                        {
+                            "anchor_loss": float(np.mean(anchor_losses)) if anchor_losses else 0.0,
+                            "anchor_loss_points": anchor_points_sum,
+                            "anchor_candidate_points": anchor_candidates_sum,
+                            "anchor_violation_ratio": float(anchor_points_sum / max(anchor_candidates_sum, 1)),
+                        }
+                    )
+                    bc_info.update(anchor_info_for_epoch)
                 if bafipo_enabled:
                     bafipo_info = {
                         "bafipo_pref_loss": float(np.mean(bafipo_pref_losses)) if bafipo_pref_losses else 0.0,
@@ -3215,34 +4713,13 @@ def train_from_config(
                     f"timing_model={rollout_timings.get('rollout_model_action_time_s', 0.0):.3f}s "
                     f"timing_env={rollout_timings.get('rollout_env_step_time_s', 0.0):.3f}s "
                     f"timing_ppo={ppo_update_time_s:.3f}s "
-                    f"group_adv={_format_float(adv_info.get('group_adv_mean', 0.0))}/"
-                    f"{_format_float(adv_info.get('group_adv_std', 0.0))} "
-                    f"ref_adv={_format_float(adv_info.get('ref_adv_mean', 0.0))}/"
-                    f"{_format_float(adv_info.get('ref_adv_std', 0.0))} "
-                    f"ref_gap={_format_float(adv_info.get('ref_base_gap_ratio_mean', 0.0))} "
-                    f"ref_mem_gate={_format_float(adv_info.get('ref_memory_gate_mean', 0.0))} "
                     f"dapg_gate={_format_float(adv_info.get('dapg_demo_gate_mean', 1.0))} "
                     f"dapg_mem_better={_format_float(adv_info.get('dapg_memory_better_rate', 0.0))} "
-                    f"bafipo={_format_float(bafipo_info.get('bafipo_pref_loss', 0.0))}/"
-                    f"{_format_float(bafipo_info.get('bafipo_pref_pair_count', 0.0))} "
-                    f"bafipo_gates={_format_float(bafipo_info.get('bafipo_quality_gate_mean', 0.0))}/"
-                    f"{_format_float(bafipo_info.get('bafipo_memory_gate_mean', 0.0))}/"
-                    f"{_format_float(bafipo_info.get('bafipo_spread_gate_mean', 0.0))} "
-                    f"gcbpo={_format_float(gcbpo_info.get('gcbpo_pref_loss', 0.0))}/"
-                    f"{_format_float(gcbpo_info.get('gcbpo_pref_pair_count', 0.0))} "
-                    f"gcbpo_branch={_format_float(gcbpo_info.get('gcbpo_branch_beats_best_rate', 0.0))}/"
-                    f"{_format_float(gcbpo_info.get('gcbpo_branch_gap_close_mean', 0.0))} "
-                    f"frro={_format_float(adv_info.get('frro_adv_mean', 0.0))} "
-                    f"frro_gate={_format_float(adv_info.get('frro_gate_mean', 0.0))} "
-                    f"frro_falsified={_format_float(adv_info.get('frro_falsified_rate', 0.0))} "
-                    f"frro_exp={_format_float(sl_info.get('frro_expert_loss', 0.0))}/"
-                    f"{_format_float(sl_info.get('frro_expert_num_routes', 0.0))} "
                     f"bc={_format_float(bc_info.get('bc_loss', 0.0))} "
                     f"bc_acc={_format_float(bc_info.get('bc_accuracy', 0.0))} "
-                    f"route_bc={_format_float(bc_info.get('route_bc_loss', 0.0))} "
-                    f"sl={_format_float(sl_info.get('sl_route_loss', 0.0))} "
-                    f"sl_ratio={_format_float(sl_info.get('sl_route_ratio_mean', 1.0))} "
-                    f"sl_clip={_format_float(sl_info.get('sl_route_clip_frac', 0.0))}",
+                    f"awbc={_format_float(bc_info.get('awbc_loss', 0.0))} "
+                    f"awbc_w={_format_float(bc_info.get('awbc_weight_mean', 0.0))} "
+                    f"bc_coef={_format_float(bc_info.get('bc_coef', 0.0))}",
                 )
 
             eval_row: dict[str, Any] = {}
@@ -3254,16 +4731,20 @@ def train_from_config(
                 eval_wall_time_s = time.perf_counter() - eval_start
                 eval_writer.writerow({"epoch": epoch, **eval_row})
                 ef.flush()
-                _debug_log(
-                    debug_enabled,
-                    df,
+                eval_message = (
                     "[Eval] "
                     f"epoch={epoch}/{epochs} n={eval_row.get('eval_num_instances')} "
                     f"fr={_format_float(eval_row.get('eval_feasible_rate'))} "
-                    f"obj={_format_float(eval_row.get('eval_avg_objective_distance_km'))} "
-                    f"veh={_format_float(eval_row.get('eval_avg_vehicle_count'))} "
-                    f"eval_wall={eval_wall_time_s:.3f}s status={eval_row.get('eval_status')}",
+                    f"min_obj={_format_float(eval_row.get('eval_avg_min_objective_distance_km', eval_row.get('eval_avg_objective_distance_km')))} "
+                    f"min_veh={_format_float(eval_row.get('eval_avg_min_vehicle_count', eval_row.get('eval_avg_vehicle_count')))} "
                 )
+                if record_eval_median:
+                    eval_message += (
+                        f"med_obj={_format_float(eval_row.get('eval_avg_median_objective_distance_km'))} "
+                        f"med_veh={_format_float(eval_row.get('eval_avg_median_vehicle_count'))} "
+                    )
+                eval_message += f"eval_wall={eval_wall_time_s:.3f}s status={eval_row.get('eval_status')}"
+                _debug_log(debug_enabled, df, eval_message)
                 eval_obj = eval_row.get("eval_avg_objective_distance_km")
                 eval_fr = eval_row.get("eval_feasible_rate", 0.0)
                 try:
@@ -3283,166 +4764,63 @@ def train_from_config(
                     )
 
             epoch_wall_time_s = time.perf_counter() - epoch_start
+            expert_stats = getattr(expert_buffer, "replay_stats", {}) if expert_buffer is not None else {}
             writer.writerow(
                 {
                     "epoch": epoch,
+                    "samples_seen": pool.sample_count,
+                    "train_mode": offline_method,
                     "reward_mean": reward_mean,
                     "policy_loss": float(loss_arr[:, 0].mean()),
                     "value_loss": float(loss_arr[:, 1].mean()),
                     "entropy": float(loss_arr[:, 2].mean()),
-                    "value_loss_total": decomposed_info.get("value_loss_total", ""),
-                    "value_loss_boundary": decomposed_info.get("value_loss_boundary", ""),
-                    "value_loss_internal": decomposed_info.get("value_loss_internal", ""),
-                    "value_consistency_loss": decomposed_info.get("value_consistency_loss", ""),
-                    "explained_variance_total": decomposed_info.get("explained_variance_total", ""),
-                    "explained_variance_boundary": decomposed_info.get("explained_variance_boundary", ""),
-                    "explained_variance_internal": decomposed_info.get("explained_variance_internal", ""),
-                    "return_total_mean": decomposed_info.get("return_total_mean", ""),
-                    "return_boundary_mean": decomposed_info.get("return_boundary_mean", ""),
-                    "return_internal_mean": decomposed_info.get("return_internal_mean", ""),
-                    "adv_total_mean": decomposed_info.get("adv_total_mean", ""),
-                    "adv_total_std": decomposed_info.get("adv_total_std", ""),
-                    "adv_boundary_mean": decomposed_info.get("adv_boundary_mean", ""),
-                    "adv_boundary_std": decomposed_info.get("adv_boundary_std", ""),
-                    "adv_internal_mean": decomposed_info.get("adv_internal_mean", ""),
-                    "adv_internal_std": decomposed_info.get("adv_internal_std", ""),
-                    "adv_actor_mean": decomposed_info.get("adv_actor_mean", ""),
-                    "adv_actor_std": decomposed_info.get("adv_actor_std", ""),
-                    "boundary_distance_mean": decomposed_info.get("boundary_distance_mean", ""),
-                    "internal_distance_mean": decomposed_info.get("internal_distance_mean", ""),
-                    "boundary_share": decomposed_info.get("boundary_share", ""),
-                    "internal_share": decomposed_info.get("internal_share", ""),
-                    "reward_decomposition_max_abs_error": decomposed_info.get("reward_decomposition_max_abs_error", ""),
-                    "reward_decomposition_mean_abs_error": decomposed_info.get("reward_decomposition_mean_abs_error", ""),
-                    "episode_decomposition_max_abs_error": decomposed_info.get("episode_decomposition_max_abs_error", ""),
-                    "episode_decomposition_mean_abs_error": decomposed_info.get("episode_decomposition_mean_abs_error", ""),
-                    "advantage_mode": decomposed_info.get("advantage_mode", ""),
-                    "samples_seen": pool.sample_count,
+                    "approx_kl": ppo_stats_info.get("approx_kl", ""),
+                    "clip_fraction": ppo_stats_info.get("clip_fraction", ""),
+                    "train_feasible_rate": train_summary.get("train_feasible_rate", ""),
+                    "train_avg_best_objective_distance_km": train_summary.get("train_avg_best_objective_distance_km", ""),
+                    "train_avg_vehicle_count": train_summary.get("train_avg_vehicle_count", ""),
+                    "train_avg_served_customers": train_summary.get("train_avg_served_customers", ""),
+                    "bc_loss": bc_info.get("bc_loss", ""),
+                    "bc_accuracy": bc_info.get("bc_accuracy", ""),
+                    "bc_action_accuracy": bc_info.get("bc_action_accuracy", ""),
+                    "bc_entropy": bc_info.get("bc_entropy", ""),
+                    "bc_coef": bc_info.get("bc_coef", ""),
+                    "awbc_loss": bc_info.get("awbc_loss", ""),
+                    "awbc_weight_mean": bc_info.get("awbc_weight_mean", ""),
+                    "awbc_weight_std": bc_info.get("awbc_weight_std", ""),
+                    "awbc_active_ratio": bc_info.get("awbc_active_ratio", ""),
+                    "awbc_expert_better_ratio": bc_info.get("awbc_expert_better_ratio", ""),
+                    "dapg_demo_gate_mean": adv_info.get("dapg_demo_gate_mean", ""),
+                    "dapg_demo_gate_std": adv_info.get("dapg_demo_gate_std", ""),
+                    "dapg_demo_active_ratio": adv_info.get("dapg_demo_active_ratio", ""),
+                    "dapg_memory_better_rate": adv_info.get("dapg_memory_better_rate", ""),
+                    "dapg_memory_gap_mean": adv_info.get("dapg_memory_gap_mean", ""),
+                    "offline_updates": offline_updates,
                     "num_envs": num_envs,
                     "n_traj": int(train_cfg.get("n_traj", 50)),
                     "rollout_steps": rollout_steps,
                     "num_minibatches": minibatches,
                     "gradient_accumulation_steps": gradient_accumulation_steps,
-                    "effective_instances_per_optimizer_step": int(np.ceil(num_envs / max(minibatches, 1))) * gradient_accumulation_steps,
-                    "train_mode": offline_method,
                     "mixed_precision": amp_enabled,
                     "use_gae": use_gae,
                     "gae_lambda": gae_lambda,
-                    "bc_loss": bc_info.get("bc_loss", ""),
-                    "bc_accuracy": bc_info.get("bc_accuracy", ""),
-                    "bc_entropy": bc_info.get("bc_entropy", ""),
-                    "bc_coef": bc_info.get("bc_coef", ""),
-                    "dapg_demo_gate_mean": adv_info.get("dapg_demo_gate_mean", ""),
-                    "dapg_demo_gate_std": adv_info.get("dapg_demo_gate_std", ""),
-                    "dapg_memory_better_rate": adv_info.get("dapg_memory_better_rate", ""),
-                    "dapg_memory_gap_mean": adv_info.get("dapg_memory_gap_mean", ""),
-                    "bafipo_pref_loss": bafipo_info.get("bafipo_pref_loss", ""),
-                    "bafipo_pref_pair_count": bafipo_info.get("bafipo_pref_pair_count", ""),
-                    "bafipo_policy_pair_count": bafipo_info.get("bafipo_policy_pair_count", ""),
-                    "bafipo_incumbent_pair_count": bafipo_info.get("bafipo_incumbent_pair_count", ""),
-                    "bafipo_quality_gate_mean": bafipo_info.get("bafipo_quality_gate_mean", ""),
-                    "bafipo_memory_gate_mean": bafipo_info.get("bafipo_memory_gate_mean", ""),
-                    "bafipo_spread_gate_mean": bafipo_info.get("bafipo_spread_gate_mean", ""),
-                    "bafipo_incumbent_beats_best_rate": bafipo_info.get("bafipo_incumbent_beats_best_rate", ""),
-                    "bafipo_incumbent_beats_mean_rate": bafipo_info.get("bafipo_incumbent_beats_mean_rate", ""),
-                    "bafipo_pref_weight_mean": bafipo_info.get("bafipo_pref_weight_mean", ""),
-                    "bafipo_pref_logit_mean": bafipo_info.get("bafipo_pref_logit_mean", ""),
-                    "bafipo_pref_coef": bafipo_info.get("bafipo_pref_coef", ""),
-                    "bafipo_minibatches_per_ppo_epoch": bafipo_info.get("bafipo_minibatches_per_ppo_epoch", ""),
-                    "gcbpo_pref_loss": gcbpo_info.get("gcbpo_pref_loss", ""),
-                    "gcbpo_prefix_loss": gcbpo_info.get("gcbpo_prefix_loss", ""),
-                    "gcbpo_pref_pair_count": gcbpo_info.get("gcbpo_pref_pair_count", ""),
-                    "gcbpo_strong_pair_count": gcbpo_info.get("gcbpo_strong_pair_count", ""),
-                    "gcbpo_soft_pair_count": gcbpo_info.get("gcbpo_soft_pair_count", ""),
-                    "gcbpo_branch_candidates": gcbpo_info.get("gcbpo_branch_candidates", ""),
-                    "gcbpo_branch_beats_best_rate": gcbpo_info.get("gcbpo_branch_beats_best_rate", ""),
-                    "gcbpo_branch_beats_top_mean_rate": gcbpo_info.get("gcbpo_branch_beats_top_mean_rate", ""),
-                    "gcbpo_branch_gap_close_mean": gcbpo_info.get("gcbpo_branch_gap_close_mean", ""),
-                    "gcbpo_prefix_valid_rate": gcbpo_info.get("gcbpo_prefix_valid_rate", ""),
-                    "gcbpo_prefix_len_mean": gcbpo_info.get("gcbpo_prefix_len_mean", ""),
-                    "gcbpo_pref_weight_mean": gcbpo_info.get("gcbpo_pref_weight_mean", ""),
-                    "gcbpo_pref_logit_mean": gcbpo_info.get("gcbpo_pref_logit_mean", ""),
-                    "gcbpo_branch_coef": gcbpo_info.get("gcbpo_branch_coef", ""),
-                    "gcbpo_prefix_coef": gcbpo_info.get("gcbpo_prefix_coef", ""),
-                    "bc_steps": bc_info.get("bc_steps", ""),
-                    "route_bc_loss": bc_info.get("route_bc_loss", ""),
-                    "route_bc_entropy": bc_info.get("route_bc_entropy", ""),
-                    "route_bc_coef": bc_info.get("route_bc_coef", ""),
-                    "route_bc_count": bc_info.get("route_bc_count", ""),
-                    "route_bc_step_count": bc_info.get("route_bc_step_count", ""),
-                    "route_bc_avg_route_len": bc_info.get("route_bc_avg_route_len", ""),
-                    "sl_route_loss": sl_info.get("sl_route_loss", ""),
-                    "sl_route_ratio_mean": sl_info.get("sl_route_ratio_mean", ""),
-                    "sl_route_ratio_std": sl_info.get("sl_route_ratio_std", ""),
-                    "sl_route_clip_frac": sl_info.get("sl_route_clip_frac", ""),
-                    "sl_route_adv_mean": sl_info.get("sl_route_adv_mean", ""),
-                    "sl_route_adv_std": sl_info.get("sl_route_adv_std", ""),
-                    "sl_num_routes_used": sl_info.get("sl_num_routes_used", ""),
-                    "sl_coef": sl_info.get("sl_coef", ""),
-                    "sl_ref_gate_mean": sl_info.get("sl_ref_gate_mean", ""),
-                    "sl_ref_gate_std": sl_info.get("sl_ref_gate_std", ""),
-                    "sl_ref_memory_gate_mean": sl_info.get("sl_ref_memory_gate_mean", ""),
-                    "sl_ref_memory_gate_std": sl_info.get("sl_ref_memory_gate_std", ""),
-                    "sl_ref_memory_better_rate": sl_info.get("sl_ref_memory_better_rate", ""),
-                    "sl_ref_memory_gap_mean": sl_info.get("sl_ref_memory_gap_mean", ""),
-                    "sl_ref_base_gap_ratio_mean": sl_info.get("sl_ref_base_gap_ratio_mean", ""),
-                    "frro_adv_mean": sl_info.get("frro_adv_mean", ""),
-                    "frro_adv_std": sl_info.get("frro_adv_std", ""),
-                    "frro_positive_mean": sl_info.get("frro_positive_mean", ""),
-                    "frro_positive_std": sl_info.get("frro_positive_std", ""),
-                    "frro_negative_mean": sl_info.get("frro_negative_mean", ""),
-                    "frro_negative_std": sl_info.get("frro_negative_std", ""),
-                    "frro_gate_mean": sl_info.get("frro_gate_mean", ""),
-                    "frro_gate_std": sl_info.get("frro_gate_std", ""),
-                    "frro_falsified_rate": sl_info.get("frro_falsified_rate", ""),
-                    "frro_best_gap_mean": sl_info.get("frro_best_gap_mean", ""),
-                    "frro_expert_loss": sl_info.get("frro_expert_loss", ""),
-                    "frro_expert_ratio_mean": sl_info.get("frro_expert_ratio_mean", ""),
-                    "frro_expert_ratio_std": sl_info.get("frro_expert_ratio_std", ""),
-                    "frro_expert_clip_frac": sl_info.get("frro_expert_clip_frac", ""),
-                    "frro_expert_adv_mean": sl_info.get("frro_expert_adv_mean", ""),
-                    "frro_expert_adv_std": sl_info.get("frro_expert_adv_std", ""),
-                    "frro_expert_gate_mean": sl_info.get("frro_expert_gate_mean", ""),
-                    "frro_expert_gate_std": sl_info.get("frro_expert_gate_std", ""),
-                    "frro_expert_num_routes": sl_info.get("frro_expert_num_routes", ""),
-                    "frro_expert_weight": sl_info.get("frro_expert_weight", ""),
-                    "offline_updates": offline_updates,
-                    "group_adv_mean": adv_info.get("group_adv_mean", ""),
-                    "group_adv_std": adv_info.get("group_adv_std", ""),
-                    "ref_adv_mean": adv_info.get("ref_adv_mean", ""),
-                    "ref_adv_std": adv_info.get("ref_adv_std", ""),
-                    "aux_adv_mean": adv_info.get("aux_adv_mean", ""),
-                    "aux_adv_std": adv_info.get("aux_adv_std", ""),
-                    "route_adv_mean": adv_info.get("route_adv_mean", ""),
-                    "route_adv_std": adv_info.get("route_adv_std", ""),
                     "best_eval_avg_objective_distance_km": best_eval_objective if np.isfinite(best_eval_objective) else "",
                     "best_eval_epoch": best_eval_epoch,
-                    "pbrs_scale": pbrs_scale,
-                    "initial_env_pool_time_s": initial_env_pool_time_s,
-                    "rollout_reset_time_s": rollout_timings.get("rollout_reset_time_s", ""),
-                    "rollout_stack_obs_time_s": rollout_timings.get("rollout_stack_obs_time_s", ""),
                     "rollout_model_action_time_s": rollout_timings.get("rollout_model_action_time_s", ""),
                     "rollout_env_step_time_s": rollout_timings.get("rollout_env_step_time_s", ""),
-                    "rollout_interaction_time_s": rollout_timings.get("rollout_interaction_time_s", ""),
                     "rollout_total_time_s": rollout_timings.get("rollout_total_time_s", ""),
                     "ppo_update_time_s": ppo_update_time_s,
                     "eval_wall_time_s": eval_wall_time_s,
                     "epoch_wall_time_s": epoch_wall_time_s,
-                    "train_feasible_rate": train_summary.get("train_feasible_rate", ""),
-                    "train_avg_best_objective_distance_km": train_summary.get("train_avg_best_objective_distance_km", ""),
-                    "train_avg_vehicle_count": train_summary.get("train_avg_vehicle_count", ""),
-                    "train_avg_served_customers": train_summary.get("train_avg_served_customers", ""),
                     "eval_avg_objective_distance_km": eval_row.get("eval_avg_objective_distance_km", ""),
+                    "eval_avg_min_objective_distance_km": eval_row.get("eval_avg_min_objective_distance_km", ""),
                     "eval_avg_vehicle_count": eval_row.get("eval_avg_vehicle_count", ""),
+                    "eval_avg_min_vehicle_count": eval_row.get("eval_avg_min_vehicle_count", ""),
                     "eval_feasible_rate": eval_row.get("eval_feasible_rate", ""),
-                    "eval_avg_runtime_s": eval_row.get("eval_avg_runtime_s", ""),
-                    "eval_num_instances": eval_row.get("eval_num_instances", ""),
-                    "eval_n_traj": eval_row.get("eval_n_traj", ""),
-                    "eval_batch_size": eval_row.get("eval_batch_size", ""),
-                    "eval_num_batches": eval_row.get("eval_num_batches", ""),
-                    "eval_decode_mode": eval_row.get("eval_decode_mode", ""),
-                    "eval_info_level": eval_row.get("eval_info_level", ""),
-                    "eval_save_routes": eval_row.get("eval_save_routes", ""),
+                    "eval_gap_mean": eval_row.get("eval_gap_mean", ""),
+                    "eval_gap_median": eval_row.get("eval_gap_median", ""),
+                    "eval_gap_p90": eval_row.get("eval_gap_p90", ""),
+                    "eval_vehicle_gap_mean": eval_row.get("eval_vehicle_gap_mean", ""),
                     "eval_status": eval_row.get("eval_status", ""),
                 }
             )

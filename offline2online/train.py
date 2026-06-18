@@ -7,7 +7,7 @@ from .trainer import load_config, train_from_config
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train migrated Ablation/TERRAN-full model on EVRPTW-D AC_v1.")
+    parser = argparse.ArgumentParser(description="Train the EVRPTW offline-to-online policy and BC/AWBC/DAPG baselines.")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--seed", type=int, required=True)
@@ -15,6 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--num-envs-per-gpu", type=int, default=None)
     parser.add_argument("--rollout-steps", type=int, default=None)
+    parser.add_argument("--ppo-update-epochs", type=int, default=None)
     parser.add_argument("--ppo-step-chunk-size", type=int, default=None)
     parser.add_argument("--n-traj", type=int, default=None)
     parser.add_argument("--num-minibatches", type=int, default=None)
@@ -30,39 +31,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-async-instance-prefetch", action="store_true")
     parser.add_argument("--async-instance-workers", type=int, default=None)
     parser.add_argument("--async-instance-queue-batches", type=int, default=None)
-    parser.add_argument("--offline-method", type=str, default=None, choices=["ppo", "bc_ppo", "dapg", "gadapg", "ga_dapg", "group_dapg", "route_bc_ppo", "sl_ppo", "frro", "bafipo", "ba_fipo", "gcbpo", "gcbpo_branch", "gcbpo_prefix"])
+    parser.add_argument("--offline-method", type=str, default=None, choices=["ppo", "bc_ppo", "awbc", "awbc_ppo", "dapg"])
     parser.add_argument("--expert-solution-path", type=str, default=None)
     parser.add_argument("--expert-dataset-path", type=str, default=None)
     parser.add_argument("--expert-limit", type=int, default=None)
     parser.add_argument("--max-replay-records", type=int, default=None)
+    parser.add_argument("--init-checkpoint-path", type=str, default=None)
     parser.add_argument("--bc-warmup-epochs", type=int, default=None)
     parser.add_argument("--bc-coef", type=float, default=None)
     parser.add_argument("--bc-decay", type=float, default=None)
     parser.add_argument("--bc-batch-size", type=int, default=None)
     parser.add_argument("--bc-updates-per-epoch", type=int, default=None)
-    parser.add_argument("--sl-coef", type=float, default=None)
-    parser.add_argument("--route-loss-coef", type=float, default=None)
-    parser.add_argument("--route-clip-eps", type=float, default=None)
-    parser.add_argument("--route-batch-size", type=int, default=None)
-    parser.add_argument("--route-updates-per-epoch", type=int, default=None)
-    parser.add_argument("--use-group-advantage", action="store_true")
-    parser.add_argument("--no-group-advantage", action="store_true")
-    parser.add_argument("--use-reference-advantage", action="store_true")
-    parser.add_argument("--no-reference-advantage", action="store_true")
-    parser.add_argument("--group-adv-coef", type=float, default=None)
-    parser.add_argument("--reference-adv-coef", type=float, default=None)
-    parser.add_argument("--reference-adv-rho", type=float, default=None)
-    parser.add_argument("--frro-coef", type=float, default=None)
-    parser.add_argument("--frro-rho", type=float, default=None)
-    parser.add_argument("--frro-clip", type=float, default=None)
-    parser.add_argument("--frro-falsification-margin", type=float, default=None)
-    parser.add_argument("--frro-falsification-eta", type=float, default=None)
-    parser.add_argument("--frro-expert-candidate-weight", type=float, default=None)
-    parser.add_argument("--bafipo-pref-coef", type=float, default=None)
-    parser.add_argument("--bafipo-beta", type=float, default=None)
-    parser.add_argument("--bafipo-policy-pairs-per-instance", type=int, default=None)
-    parser.add_argument("--bafipo-incumbent-pairs-per-instance", type=int, default=None)
-    parser.add_argument("--bafipo-minibatches-per-ppo-epoch", type=int, default=None)
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--no-mixed-precision", action="store_true")
     parser.add_argument("--eval-interval", type=int, default=None)
@@ -116,6 +95,8 @@ def main() -> None:
         overrides["training"]["num_envs_per_gpu"] = args.num_envs_per_gpu
     if args.rollout_steps is not None:
         overrides["training"]["rollout_steps"] = args.rollout_steps
+    if args.ppo_update_epochs is not None:
+        overrides["training"]["ppo_update_epochs"] = args.ppo_update_epochs
     if args.ppo_step_chunk_size is not None:
         overrides["training"]["ppo_step_chunk_size"] = args.ppo_step_chunk_size
     if args.n_traj is not None:
@@ -148,6 +129,8 @@ def main() -> None:
         overrides["offline"]["expert_limit"] = args.expert_limit
     if args.max_replay_records is not None:
         overrides["offline"]["max_replay_records"] = args.max_replay_records
+    if args.init_checkpoint_path is not None:
+        overrides["offline"]["init_checkpoint_path"] = args.init_checkpoint_path
     if args.bc_warmup_epochs is not None:
         overrides["offline"]["bc_warmup_epochs"] = args.bc_warmup_epochs
     if args.bc_coef is not None:
@@ -158,52 +141,6 @@ def main() -> None:
         overrides["offline"]["bc_batch_size"] = args.bc_batch_size
     if args.bc_updates_per_epoch is not None:
         overrides["offline"]["bc_updates_per_epoch"] = args.bc_updates_per_epoch
-    if args.sl_coef is not None:
-        overrides["offline"]["sl_coef"] = args.sl_coef
-    if args.route_loss_coef is not None:
-        overrides["offline"]["route_loss_coef"] = args.route_loss_coef
-    if args.route_clip_eps is not None:
-        overrides["offline"]["route_clip_eps"] = args.route_clip_eps
-    if args.route_batch_size is not None:
-        overrides["offline"]["route_batch_size"] = args.route_batch_size
-    if args.route_updates_per_epoch is not None:
-        overrides["offline"]["route_updates_per_epoch"] = args.route_updates_per_epoch
-    if args.use_group_advantage:
-        overrides["advantage"]["use_group_advantage"] = True
-    if args.no_group_advantage:
-        overrides["advantage"]["use_group_advantage"] = False
-    if args.use_reference_advantage:
-        overrides["advantage"]["use_reference_advantage"] = True
-    if args.no_reference_advantage:
-        overrides["advantage"]["use_reference_advantage"] = False
-    if args.group_adv_coef is not None:
-        overrides["advantage"]["group_adv_coef"] = args.group_adv_coef
-    if args.reference_adv_coef is not None:
-        overrides["advantage"]["reference_adv_coef"] = args.reference_adv_coef
-    if args.reference_adv_rho is not None:
-        overrides["advantage"]["reference_adv_rho"] = args.reference_adv_rho
-    if args.frro_coef is not None:
-        overrides["advantage"]["frro_coef"] = args.frro_coef
-    if args.frro_rho is not None:
-        overrides["advantage"]["frro_rho"] = args.frro_rho
-    if args.frro_clip is not None:
-        overrides["advantage"]["frro_clip"] = args.frro_clip
-    if args.frro_falsification_margin is not None:
-        overrides["advantage"]["frro_falsification_margin"] = args.frro_falsification_margin
-    if args.frro_falsification_eta is not None:
-        overrides["advantage"]["frro_falsification_eta"] = args.frro_falsification_eta
-    if args.frro_expert_candidate_weight is not None:
-        overrides["advantage"]["frro_expert_candidate_weight"] = args.frro_expert_candidate_weight
-    if args.bafipo_pref_coef is not None:
-        overrides["offline"]["bafipo_pref_coef"] = args.bafipo_pref_coef
-    if args.bafipo_beta is not None:
-        overrides["offline"]["bafipo_beta"] = args.bafipo_beta
-    if args.bafipo_policy_pairs_per_instance is not None:
-        overrides["offline"]["bafipo_policy_pairs_per_instance"] = args.bafipo_policy_pairs_per_instance
-    if args.bafipo_incumbent_pairs_per_instance is not None:
-        overrides["offline"]["bafipo_incumbent_pairs_per_instance"] = args.bafipo_incumbent_pairs_per_instance
-    if args.bafipo_minibatches_per_ppo_epoch is not None:
-        overrides["offline"]["bafipo_minibatches_per_ppo_epoch"] = args.bafipo_minibatches_per_ppo_epoch
     if args.eval_interval is not None:
         overrides["evaluation"]["eval_interval"] = args.eval_interval
     if args.eval_path is not None:

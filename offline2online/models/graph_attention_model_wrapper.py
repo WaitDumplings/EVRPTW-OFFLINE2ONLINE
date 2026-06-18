@@ -31,6 +31,9 @@ def prepare_observation_batch(obs: dict[str, Any]) -> dict[str, Any]:
             "cus_loc",
             "rs_loc",
             "time_window",
+            "edge_distance",
+            "edge_time",
+            "edge_energy",
             "action_mask",
             "node_visit_count",
             "customer_visited",
@@ -152,6 +155,10 @@ class Backbone(nn.Module):
         use_graph_token: bool = True,
         use_dynamic_decision_encoder: bool = False,
         dynamic_decision_heads: int = 4,
+        dynamic_decision_delta_k: bool = True,
+        dynamic_decision_delta_v: bool = True,
+        dynamic_decision_delta_action_key: bool = True,
+        dynamic_decision_action_bias: bool = True,
     ):
         super().__init__()
         del use_graph_token  # graph token is intrinsic to the migrated graph encoder.
@@ -171,6 +178,10 @@ class Backbone(nn.Module):
             tanh_clipping=tanh_clipping,
             use_dynamic_decision_encoder=use_dynamic_decision_encoder,
             dynamic_decision_heads=dynamic_decision_heads,
+            dynamic_decision_delta_k=dynamic_decision_delta_k,
+            dynamic_decision_delta_v=dynamic_decision_delta_v,
+            dynamic_decision_delta_action_key=dynamic_decision_delta_action_key,
+            dynamic_decision_action_bias=dynamic_decision_action_bias,
         )
 
         self.dist_bias_scale = nn.Parameter(torch.tensor(1.0))
@@ -197,7 +208,13 @@ class Backbone(nn.Module):
 
     def _build_attn_bias(self, state: StateWrapper) -> torch.Tensor:
         node_inputs = state.observations
-        dist_mat = self._build_distance_matrix(node_inputs)
+        dist_mat = state.states.get("edge_distance")
+        if dist_mat is None:
+            dist_mat = self._build_distance_matrix(node_inputs)
+        else:
+            dist_mat = dist_mat.to(device=node_inputs["cus_loc"].device, dtype=node_inputs["cus_loc"].dtype)
+            if dist_mat.dim() == 2:
+                dist_mat = dist_mat.unsqueeze(0)
         node_type = self._build_node_type(node_inputs)
         dist_bias = -self.dist_bias_scale * dist_mat
         pair_id = node_type.unsqueeze(2) * 3 + node_type.unsqueeze(1)
@@ -297,6 +314,10 @@ class Agent(nn.Module):
         use_graph_token: bool = True,
         use_dynamic_decision_encoder: bool = False,
         dynamic_decision_heads: int = 4,
+        dynamic_decision_delta_k: bool = True,
+        dynamic_decision_delta_v: bool = True,
+        dynamic_decision_delta_action_key: bool = True,
+        dynamic_decision_action_bias: bool = True,
         use_decomposed_critic: bool = False,
     ):
         super().__init__()
@@ -309,6 +330,10 @@ class Agent(nn.Module):
             use_graph_token=use_graph_token,
             use_dynamic_decision_encoder=use_dynamic_decision_encoder,
             dynamic_decision_heads=dynamic_decision_heads,
+            dynamic_decision_delta_k=dynamic_decision_delta_k,
+            dynamic_decision_delta_v=dynamic_decision_delta_v,
+            dynamic_decision_delta_action_key=dynamic_decision_delta_action_key,
+            dynamic_decision_action_bias=dynamic_decision_action_bias,
         )
         self.actor = Actor()
         self.critic = Critic(hidden_size=embedding_dim, use_decomposed_critic=use_decomposed_critic)
