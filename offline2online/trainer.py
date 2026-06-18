@@ -656,6 +656,38 @@ def _resolve_path(path: str | Path | None) -> Path | None:
     return out if out.is_absolute() else REPO_ROOT / out
 
 
+def _validate_dataset_metadata(
+    path: str | Path | None,
+    *,
+    num_customers: int,
+    num_charging_stations: int,
+    label: str,
+) -> None:
+    dataset_path = _resolve_path(path)
+    if dataset_path is None:
+        return
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"{label} dataset path does not exist: {dataset_path}")
+    metadata_path = dataset_path / "metadata.json" if dataset_path.is_dir() else dataset_path.parent / "metadata.json"
+    if not metadata_path.exists():
+        return
+    with metadata_path.open("r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    meta_customers = metadata.get("num_customers")
+    meta_cs = metadata.get("num_charging_stations")
+    if meta_customers is not None and int(meta_customers) != int(num_customers):
+        raise ValueError(
+            f"{label} dataset metadata mismatch at {metadata_path}: "
+            f"config num_customers={num_customers}, metadata num_customers={meta_customers}"
+        )
+    if meta_cs is not None and int(meta_cs) != int(num_charging_stations):
+        raise ValueError(
+            f"{label} dataset metadata mismatch at {metadata_path}: "
+            f"config num_charging_stations={num_charging_stations}, "
+            f"metadata num_charging_stations={meta_cs}"
+        )
+
+
 def _load_agent_checkpoint(
     agent: Agent,
     path: str | Path | None,
@@ -3245,6 +3277,27 @@ def train_from_config(
     data_cfg = cfg["data"]
     num_customers = int(data_cfg.get("num_customers", 50))
     num_cs = int(data_cfg.get("num_charging_stations", 10))
+    train_dataset_path = data_cfg.get("train_dataset_path") or data_cfg.get("instance_dataset_path") or data_cfg.get("fixed_train_path")
+    _validate_dataset_metadata(
+        train_dataset_path,
+        num_customers=num_customers,
+        num_charging_stations=num_cs,
+        label="train",
+    )
+    _validate_dataset_metadata(
+        eval_cfg.get("eval_path"),
+        num_customers=num_customers,
+        num_charging_stations=num_cs,
+        label="eval",
+    )
+    expert_dataset_path = offline_cfg.get("expert_dataset_path")
+    if expert_dataset_path not in (None, "", train_dataset_path):
+        _validate_dataset_metadata(
+            expert_dataset_path,
+            num_customers=num_customers,
+            num_charging_stations=num_cs,
+            label="expert",
+        )
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"

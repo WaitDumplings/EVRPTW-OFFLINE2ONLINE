@@ -1,14 +1,14 @@
-run_name: O2O_CUS50_DAPG_SEED3009
+run_name: O2O_CUS15_TRUE_METRIC_PPO_SEED3009
 dataset_name: EVRPTW-D_Geo-AC-v1
 data:
-  num_customers: 50
-  num_charging_stations: 10
+  num_customers: 15
+  num_charging_stations: 3
   mother_board_pool_size: 8
   mother_num_customers: 5000
   mother_num_charging_stations: 120
   region_reuse_limit: 200
   max_attempts_per_instance: 30
-  train_dataset_path: /data/Maojie/dataset_v1/dataset/train/Cus50
+  train_dataset_path: /data/Maojie/dataset_v1/dataset/train/Cus15
   train_sample_mode: shuffle_cycle
   async_instance_prefetch: false
 env:
@@ -34,7 +34,7 @@ critic:
   advantage_mode: total
 training:
   online_training: false
-  epochs: 2000
+  epochs: 1500
   num_envs_per_gpu: 256
   n_traj: 50
   rollout_steps: 90
@@ -52,6 +52,8 @@ training:
   checkpoint_interval: 50
   debug: true
   debug_log_every: 1
+  profile_timing: false
+  gradient_accumulation_steps: 1
   mixed_precision: true
 pbrs:
   use_customer_pbrs: false
@@ -60,23 +62,13 @@ pbrs:
   use_terminal_heuristic: false
 evaluation:
   eval_interval: 10
-  eval_path: /data/Maojie/dataset_v1/dataset/val/Cus50
+  eval_path: /data/Maojie/dataset_v1/dataset/val/Cus15
   eval_n_traj: 50
   eval_decode_mode: sample
   eval_max_steps: 100
+  eval_limit: null
   eval_batch_size: 1000
   eval_info_level: light
   eval_save_routes: false
 offline:
-  method: dapg
-  init_checkpoint_strict: false
-  expert_solution_path: /data/Maojie/gurobi_mul_legacy/results/train/Cus50/gurobi_summary.csv
-  expert_dataset_path: /data/Maojie/dataset_v1/dataset/train/Cus50
-  strict_replay: false
-  bc_warmup_epochs: 10
-  bc_warmup_coef: 1.0
-  bc_batch_size: 512
-  bc_updates_per_epoch: 16
-  bc_coef: 0.10
-  bc_decay: 0.995
-  min_bc_coef: 0.0
+  method: ppo

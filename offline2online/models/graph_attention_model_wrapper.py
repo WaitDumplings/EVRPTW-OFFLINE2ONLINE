@@ -81,6 +81,23 @@ def prepare_observation_batch(obs: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _require_edge_matrix(states: dict[str, torch.Tensor], key: str, expected_nodes: int) -> None:
+    value = states.get(key)
+    if value is None:
+        raise KeyError(
+            f"EVRPTW observation is missing {key!r}. "
+            "This cleaned branch requires true road-network edge matrices; "
+            "falling back to Euclidean coordinate distance would invalidate the true-metric experiments."
+        )
+    if value.dim() not in (2, 3):
+        raise ValueError(f"Expected {key} to have shape [N,N] or [B,N,N], got {tuple(value.shape)}")
+    if int(value.size(-1)) != expected_nodes or int(value.size(-2)) != expected_nodes:
+        raise ValueError(
+            f"{key} shape {tuple(value.shape)} does not match expected node count {expected_nodes} "
+            "(depot + customers + charging stations)."
+        )
+
+
 def orthogonal_init(layer: nn.Module, gain: float = 1.0) -> None:
     if isinstance(layer, nn.Linear):
         nn.init.orthogonal_(layer.weight, gain=gain)
@@ -112,6 +129,13 @@ class StateWrapper:
         demand = self._as_node_scalar(self.states["demand"])
         service_time = self._as_node_scalar(self.states["service_time"])
         time_window = self.states["time_window"].float()
+        expected_nodes = (
+            1
+            + int(self.states["cus_loc"].size(1))
+            + int(self.states["rs_loc"].size(1))
+        )
+        for key in ("edge_distance", "edge_time", "edge_energy"):
+            _require_edge_matrix(self.states, key, expected_nodes)
 
         observations = {
             "depot_loc": self.states["depot_loc"].float(),
